@@ -29,14 +29,14 @@ class AI2DDataset(Dataset):
         self.image_to_question = OrderedDict()
         if root_dir:
             self._init_questions(root_dir)
-        
+
     def _init_questions(self, root_dir):
         questions_dir = os.path.join(root_dir, "questions")
         images_dir = os.path.join(root_dir, "images")
         for path in os.listdir(questions_dir):
             with open(os.path.join(questions_dir, path), "r") as f:
                 data = json.load(f)
-            image_name = data['imageName']
+            image_name = data["imageName"]
             image_path = os.path.join(images_dir, image_name)
             for question, question_data in data["questions"].items():
                 answer = question_data["answerTexts"][question_data["correctAnswer"]]
@@ -51,7 +51,6 @@ class AI2DDataset(Dataset):
                 else:
                     self.image_to_question[image_name] = [question]
 
-    
     # Splits on `proportion` images.
     def split(self, proportion) -> Tuple["AI2DDataset", "AI2DDataset"]:
         images = list(self.image_to_question.keys())
@@ -65,7 +64,6 @@ class AI2DDataset(Dataset):
             second.questions.extend(self.image_to_question[image_name])
             second.image_to_question[image_name] = self.image_to_question[image_name]
         return first, second
-
 
     def __len__(self):
         return len(self.questions)
@@ -96,7 +94,7 @@ class DataCollatorForMultiModal(object):
         except Exception as e:
             for image in images:
                 print(image.size)
-            raise e
+            return None
         if result is None:
             raise ValueError
         out = {
