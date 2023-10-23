@@ -1,7 +1,7 @@
 import json
 import random
-from collections import OrderedDict
-from typing import Dict, Tuple, List, Any
+from collections import OrderedDict, defaultdict
+from typing import Dict, Tuple, List, Any, Set, Optional
 import os
 import copy
 from dataclasses import dataclass
@@ -13,6 +13,90 @@ from transformers import FuyuProcessor, FuyuImageProcessor, AutoTokenizer
 
 random.seed(102123)
 
+class AI2DDatasetForEval(Dataset):
+    def __init__(self, root_dir: str, processor: FuyuProcessor, question_ids: List[str]):
+        self.questions: List[Dict[str, Any]] = []
+        self.image_to_question_indices = OrderedDict()
+        self.processor = processor
+        self.include_labels = True
+        self.question_ids = set(question_ids)
+        self.by_question_id = defaultdict(list)
+        self._init_questions(root_dir)
+    
+    def _init_questions(self, root_dir):
+        # each question should correspond to each of the 
+        self.questions, self.image_to_question_indices = get_questions(root_dir, self.question_ids, False)
+        for question in self.questions:
+            self.by_question_id[question['question_id']].append(question)
+
+    def get_model_inputs_for_question(self, q):
+        image = Image.open(q["image_path"]).convert("RGB")
+        model_inputs = self.processor(images=image, text=q["question"])
+        if model_inputs is None:
+            raise ValueError(f"ModelInputs is none on {idx}")
+        if self.include_labels:
+            input_ids = model_inputs["input_ids"].squeeze()
+            target = q["answer"]
+            target_ids = self.processor.tokenizer.encode(
+                target + self.processor.tokenizer.eos_token,
+                add_special_tokens=False,
+                return_tensors="pt",
+            ).squeeze()
+            # input_ids should have boa token.
+            all_ids = torch.concat([input_ids, target_ids])
+            labels = copy.deepcopy(all_ids)
+            labels[: input_ids.shape[0]] = -100
+            model_inputs["input_ids"] = all_ids
+            model_inputs["labels"] = labels
+        return model_inputs, q
+
+    def __len__(self):
+        return len(self.questions)
+
+    def __getitem__(self, idx):
+        q = self.questions[idx]
+        return self.get_model_inputs_for_question(q)
+
+    
+def get_questions(root_dir: str, question_ids: Optional[Set[str]], correct_only: bool):
+    image_to_question_indices = {}
+    questions = []
+
+    questions_dir = os.path.join(root_dir, 'questions')
+    images_dir = os.path.join(root_dir, 'images')
+    label_skips = 0
+    for path in sorted(os.listdir(questions_dir)):
+        with open(os.path.join(questions_dir, path), "r") as f:
+            data = json.load(f)
+        image_name = data["imageName"]
+        image_path = os.path.join(images_dir, image_name)
+        for question_text, question_data in data["questions"].items():
+            question_id = question_data['questionId']
+            if question_ids is not None and question_id not in question_ids:
+                continue
+            if 'label' in question_text.lower():
+                label_skips += 1
+                continue
+            for i, answerText in enumerate(question_data['answerTexts']):
+                if correct_only and question_data['correctAnswer'] != i:
+                    continue
+                questions.append({
+                    "image_path": image_path,
+                    "question": question_text,
+                    "answer": answerText,
+                    "question_id": question_id,
+                    'isCorrect': question_data['correctAnswer'] == i
+                })
+                if image_name in image_to_question_indices:
+                    image_to_question_indices[image_name].append(
+                        len(questions) - 1
+                    )
+                else:
+                    image_to_question_indices[image_name] = [
+                        len(questions) - 1
+                    ]
+    print(f'Skipped {label_skips} questions, leaving {len(questions)}.')
+    return questions, image_to_question_indices
 
 class AI2DDataset(Dataset):
     def __init__(self, root_dir: str, processor: FuyuProcessor):
@@ -23,29 +107,7 @@ class AI2DDataset(Dataset):
         self._init_questions(root_dir)
 
     def _init_questions(self, root_dir):
-        questions_dir = os.path.join(root_dir, "questions")
-        images_dir = os.path.join(root_dir, "images")
-        for path in sorted(os.listdir(questions_dir)):
-            with open(os.path.join(questions_dir, path), "r") as f:
-                data = json.load(f)
-            image_name = data["imageName"]
-            image_path = os.path.join(images_dir, image_name)
-            for question, question_data in data["questions"].items():
-                answer = question_data["answerTexts"][question_data["correctAnswer"]]
-                question = {
-                    "image_path": image_path,
-                    "question": question,
-                    "answer": answer,
-                }
-                self.questions.append(question)
-                if image_name in self.image_to_question_indices:
-                    self.image_to_question_indices[image_name].append(
-                        len(self.questions) - 1
-                    )
-                else:
-                    self.image_to_question_indices[image_name] = [
-                        len(self.questions) - 1
-                    ]
+        self.questions, self.image_to_question_indices = get_questions(root_dir, None, True)
 
     def __len__(self):
         return len(self.questions)
@@ -72,7 +134,7 @@ class AI2DDataset(Dataset):
             model_inputs["labels"] = labels
         return model_inputs
 
-    def split(self, prop: float) -> Tuple["AI2DDataset", "AI2DDataset"]:
+    def split(self, prop: float) -> Tuple["AI2DDataset", "AI2DDataset", List[str], List[str]]:
         images = list(self.image_to_question_indices.keys())
         random.shuffle(images)
         idx = int(prop * len(images))
@@ -82,7 +144,10 @@ class AI2DDataset(Dataset):
             first_indices.extend(self.image_to_question_indices[im])
         for im in second_images:
             second_indices.extend(self.image_to_question_indices[im])
-        return Subset(self, first_indices), Subset(self, second_indices)
+        
+        first_questions=[self.questions[i]['question_id']for i in first_indices]
+        second_questions=[self.questions[i]['question_id']for i in second_indices]
+        return (Subset(self, first_indices), Subset(self, second_indices), first_questions, second_questions)
 
 
 @dataclass
@@ -108,7 +173,6 @@ class DataCollatorForMultimodal(object):
         collated["input_ids"][~attention_mask] = self.pad_token_id
         collated["attention_mask"] = attention_mask
         return collated
-
 
 if __name__ == "__main__":
     pretrained_path = "adept/fuyu-8b"

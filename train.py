@@ -1,8 +1,8 @@
 import transformers
 import glob
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 import os
-import fuyu.data as data, helpers
+import data, helpers
 import torch
 import wandb
 from peft import get_peft_model, PeftModel
@@ -14,7 +14,8 @@ from typing import Optional
 from dataclasses import dataclass, field
 import bitsandbytes as bnb
 
-
+grouped_question_metadata = None
+grouped_model_inputs = None
 @dataclass
 class Config:
     per_device_batch_size: int = field(default=2)
@@ -28,12 +29,12 @@ class Config:
     gradient_accumulation_steps: int = field(default=1)
     max_eval_steps: Optional[int] = field(default=None)
     train_on_questions: bool = field(default=False)
-    resume_run_name: Optional[str] = field(default=None)
+    run_name: Optional[str] = field(default=None)
     save_every_steps: int = field(default=500)
     eval_every_steps: int = field(default=500)
 
 
-Data = namedtuple("Data", ["train_dataloader", "eval_dataloader", "data_collator"])
+Data = namedtuple("Data", ["train_dataloader", "eval_dataloader", "data_collator", "dataset_for_auto_eval"])
 
 
 def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
@@ -81,8 +82,11 @@ def get_data(config: Config):
     )
     # processor.max_tokens_to_generate = 0
     full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor)
-    train_dataset, eval_dataset = full_ds.split(0.97)
+    train_dataset, eval_dataset, _, eval_question_ids = full_ds.split(0.97)
+    dataset_for_auto_eval = data.AI2DDatasetForEval("/home/ubuntu/ai2d", processor, eval_question_ids)
+
     data_collator = data.DataCollatorForMultimodal(pad_token_id=0)
+    
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -100,7 +104,7 @@ def get_data(config: Config):
         pin_memory=True,
         num_workers=min(eval_batch_size, 8),
     )
-    return Data(train_dataloader, eval_dataloader, data_collator)
+    return Data(train_dataloader, eval_dataloader, data_collator, dataset_for_auto_eval)
 
 
 def save_model(step, model, is_lora):
@@ -113,27 +117,26 @@ def save_model(step, model, is_lora):
     model.save_pretrained(model_path)
 
 
-def load_model(config: Config):
+def load_model(config: Config, device="cuda:0"):
     model: transformers.FuyuForCausalLM = transformers.FuyuForCausalLM.from_pretrained(
-        "adept/fuyu-8b", device_map="cuda:0", torch_dtype=torch.bfloat16
+        "adept/fuyu-8b", device_map=device, torch_dtype=torch.bfloat16
     )
     checkpoint_dir = None
-    if config.resume_run_name is not None:
-        run_dir = f"/home/ubuntu/fuyu/output/{config.resume_run_name}/"
+    if config.run_name is not None:
+        run_dir = f"/home/ubuntu/fuyu/output/{config.run_name}/"
         paths = glob.glob(os.path.join(run_dir, "step-*"))
         steps = [p.split("-")[-1] for p in paths]
         if "final" in steps:
-            raise NotImplementedError(
-                f"Resuming a finished run f{config.resume_run_name} is not supported."
-            )
-        step = max([int(s) for s in steps])
-        checkpoint_dir = os.path.join(run_dir, f"step-{step}")
+            checkpoint_dir = os.path.join(run_dir, f"step-final")
+        else:
+            step = max([int(s) for s in steps])
+            checkpoint_dir = os.path.join(run_dir, f"step-{step}")
 
     model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
     if config.lora:
         return get_lora_model(model, checkpoint_dir, config)
-    elif config.resume_run_name is not None:
+    elif config.run_name is not None:
         raise NotImplementedError("Resuming non-finetune runs not yet implemented.")
     return model
 
@@ -156,6 +159,58 @@ def do_eval(model, step, max_steps, eval_dataloader):
     wandb.log({"step": step, "loss/val": avg_loss})
     model.train()
 
+def do_auto_eval(model, step, max_questions, data_collator, dataset_for_auto_eval):
+    print("Doing auto eval.")
+    global grouped_model_inputs
+    global grouped_question_metadata
+    if grouped_model_inputs is None or grouped_question_metadata is None:
+        grouped_model_inputs = defaultdict(list)
+        grouped_question_metadata = dataset_for_auto_eval.by_question_id
+    correct_by_question_id = {}
+    for i, question_id in enumerate(tqdm(grouped_question_metadata.keys(), total=max_questions)):
+        if max_questions is not None and i > max_questions:
+            break
+        meta = grouped_question_metadata[question_id]
+        model_inputs_list = [
+            dataset_for_auto_eval.get_model_inputs_for_question(meta[i])[0]
+            for i in range(len(meta))
+        ]
+        grouped_model_inputs[question_id] = model_inputs_list
+        probs = []
+        # Ensure all tensors are on the same device as the model
+        def chunk(l, n):
+            for i in range(0, len(l), n):
+                yield l[i:i + n]
+        correctness = [meta[i]['isCorrect'] for i in range(len(meta))]
+        probs = []
+        if any([single_model_inputs['input_ids'].shape[0] > 600 for single_model_inputs in model_inputs_list]):
+            chunk_size = 1
+        else:
+            chunk_size = 2
+        for model_inputs in chunk(model_inputs_list, chunk_size): 
+            collated = data_collator(model_inputs)
+            with torch.inference_mode(), torch.autocast('cuda'):
+                logits = model(**helpers.clean(collated)).logits
+                shifted_logits = logits[:, :-1, :].contiguous().cuda()
+                shifted_labels = collated['labels'][..., 1:].contiguous().cuda()
+
+                log_probs = torch.nn.functional.log_softmax(shifted_logits, dim=-1)
+                non_ignore_indices = shifted_labels.ne(-100)
+                gather_indices = torch.where(non_ignore_indices, shifted_labels, 0)
+                selected_log_probs = torch.gather(log_probs, 2, gather_indices.unsqueeze(-1)).squeeze(-1)
+                selected_log_probs = torch.where(non_ignore_indices, selected_log_probs, 0.0)
+                sequence_log_prob = torch.sum(selected_log_probs, dim=1)
+                result = torch.exp(sequence_log_prob)
+                probs.append(result.cpu().numpy())
+        probs = [p for sublist in probs for p in sublist]
+        if all([p == 0 for p in probs]):
+            print(f'Question {question_id} has no valid answers.')
+        else:
+            is_correct = correctness[probs.index(max(probs))]
+            correct_by_question_id[question_id] = is_correct
+    accuracy = sum(correct_by_question_id.values()) / len(correct_by_question_id)
+    print(accuracy)
+    wandb.log({"step": step, "eval_accuracy": accuracy})
 
 def train(
     model,
@@ -214,6 +269,7 @@ def train(
         if (step + 1) % config.save_every_steps == 0:
             save_model(step + 1, model, config.lora)
         if (step + 1) % config.eval_every_steps == 0 or step == 0:
+            do_auto_eval(model, step+1, None, data.data_collator, data.dataset_for_auto_eval)
             do_eval(model, step + 1, config.max_eval_steps, data.eval_dataloader)
     save_model("final", model, config.lora)
 
@@ -231,7 +287,7 @@ def main():
         gradient_accumulation_steps=1,
         max_eval_steps=None,
         train_on_questions=False,
-        resume_run_name=None,
+        run_name=None,
         save_every_steps=500,
         eval_every_steps=500,
     )
