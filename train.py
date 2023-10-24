@@ -12,7 +12,9 @@ from torch.utils.data import DataLoader
 from transformers import get_scheduler
 from tqdm import tqdm
 from typing import Optional
-from dataclasses import dataclass, field
+import argparse
+from dataclasses import asdict
+from dataclasses import dataclass, field, asdict
 import bitsandbytes as bnb
 
 grouped_question_metadata = None
@@ -207,7 +209,7 @@ def train(
         optimizer.zero_grad()
         if (step + 1) % config.save_every_steps == 0:
             save_model(step + 1, model, config.lora)
-        if (step + 1) % config.eval_every_steps == 0 or step == 0:
+        if (step + 1) % config.eval_every_steps == 0:
             accuracy, eval_loss = eval.do_auto_eval(
                 model, None, data.data_collator, data.dataset_for_auto_eval
             )
@@ -238,6 +240,36 @@ def main():
     print("Loaded model.")
     train(model, config)
 
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Training Configuration")
+    for field_name, field_value in asdict(Config()).items():
+        parser.add_argument(f"--{field_name}", type=type(field_value), default=field_value)
+
+    args = parser.parse_args()
+
+    config = Config(
+        per_device_batch_size=args.per_device_batch_size,
+        learning_rate=args.learning_rate,
+        scheduler_type=args.scheduler_type,
+        warmup_steps=args.warmup_steps,
+        lora=args.lora,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        use_8bit_optimizer=args.use_8bit_optimizer,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_eval_steps=args.max_eval_steps,
+        train_on_questions=args.train_on_questions,
+        run_name=args.run_name,
+        save_every_steps=args.save_every_steps,
+        eval_every_steps=args.eval_every_steps,
+    )
+
+    model = load_model(config)
+    print("Loaded model.")
+    train(model, config)
 
 if __name__ == "__main__":
     main()
