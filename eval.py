@@ -10,12 +10,9 @@ def do_eval(model, step, max_steps, eval_dataloader):
     losses = []
     print("Doing evaluation.")
     model.eval()
-    for i, batch in enumerate(tqdm(eval_dataloader)):
+    for i, batch in enumerate(tqdm(eval_dataloader, total=max_steps)):
         if max_steps is not None and i > max_steps:
             break
-        if batch is None:
-            print(f"Step {i} threw an error.")
-            continue
         cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
         with torch.inference_mode(), torch.autocast("cuda"):
             loss = model(**cleaned_batch).loss
@@ -27,7 +24,6 @@ def do_eval(model, step, max_steps, eval_dataloader):
 
 def get_subbatches(batch, batch_size):
     if batch_size > 1 and batch["input_ids"].shape[1] > 600:
-        # break up the batch on the b dimension.
         subbatches = [{} for _ in range(batch["input_ids"].shape[0])]
         for k, v in batch.items():
             for j in range(len(subbatches)):
@@ -36,12 +32,11 @@ def get_subbatches(batch, batch_size):
                 else:
                     subbatches[j][k] = [v[j]]
     elif batch_size > 2 and batch["input_ids"].shape[1] > 400:
-        # break up the batch on the b dimension, but in pairs.
         subbatches = [{} for _ in range(batch["input_ids"].shape[0] // 2)]
         for k, v in batch.items():
             for j in range(len(subbatches)):
                 if isinstance(v, torch.Tensor):
-                    subbatches[j][k] = v[j * 2 : j * 2 + 2, ...]
+                    subbatches[j][k] = v[j * 2 : (j + 1) * 2, ...]
                 else:
                     subbatches[j][k] = [v[j * 2], v[j * 2 + 1]]
     else:
@@ -49,16 +44,7 @@ def get_subbatches(batch, batch_size):
     return subbatches
 
 
-def do_auto_eval(model, max_questions, data_collator, dataset_for_auto_eval):
-    print("Doing auto eval.")
-    batch_size = 4
-    dataloader = DataLoader(
-        dataset_for_auto_eval,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=data_collator,
-        pin_memory=True,
-    )
+def do_auto_eval(model, max_questions, dataloader: DataLoader):
     results_by_question_id = defaultdict(list)
     losses = []
     model.eval()
@@ -73,6 +59,7 @@ def do_auto_eval(model, max_questions, data_collator, dataset_for_auto_eval):
         accuracy = sum(correct_by_question_id.values()) / len(correct_by_question_id)
         return accuracy
 
+    batch_size = dataloader.batch_size
     total = (
         ((max_questions * 4) // batch_size)
         if max_questions is not None
@@ -108,13 +95,11 @@ def do_auto_eval(model, max_questions, data_collator, dataset_for_auto_eval):
                 probs = torch.exp(sequence_log_prob).cpu().numpy()
                 # push correct losses to losses array
             is_correct = subbatch["is_correct"].cpu().numpy()
-            aic = any(is_correct)
-            if aic:
-                loss = outputs.loss.cpu().numpy()
+            loss = outputs.loss.cpu().numpy()
             question_ids = subbatch["question_id"]
             for j, question_id in enumerate(question_ids):
                 results_by_question_id[question_id].append((probs[j], is_correct[j]))
-                if aic and is_correct[j]:
+                if is_correct[j]:
                     if len(loss.shape):
                         losses.append(loss[j])
                     else:

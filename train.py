@@ -13,6 +13,8 @@ from transformers import get_scheduler
 from tqdm import tqdm
 from typing import Optional
 import argparse
+import numpy as np
+import random
 from dataclasses import asdict
 from dataclasses import dataclass, field, asdict
 import bitsandbytes as bnb
@@ -24,12 +26,14 @@ grouped_model_inputs = None
 @dataclass
 class Config:
     per_device_batch_size: int = field(default=2)
-    learning_rate: float = field(default=3e-5)
+    learning_rate: float = field(default=3e-4)
     scheduler_type: str = field(default="constant")
-    warmup_steps: int = field(default=0)
+    warmup_steps: int = field(default=200)
     lora: bool = field(default=True)
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=32)
+    lora_vision: bool = field(default=False)
+    use_adafactor: bool = field(default=False)
     use_8bit_optimizer: bool = field(default=False)
     gradient_accumulation_steps: int = field(default=1)
     max_eval_steps: Optional[int] = field(default=None)
@@ -37,11 +41,13 @@ class Config:
     run_name: Optional[str] = field(default=None)
     save_every_steps: int = field(default=500)
     eval_every_steps: int = field(default=500)
+    weight_decay: float = field(default=0.0)
+    do_vocab_surgery: bool = field(default=True)
 
 
 Data = namedtuple(
     "Data",
-    ["train_dataloader", "eval_dataloader", "data_collator", "dataset_for_auto_eval"],
+    ["train_dataloader", "eval_dataloader", "data_collator", "auto_eval_dataloader"],
 )
 
 
@@ -58,7 +64,8 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
                 lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
         lora_module_names.remove("lm_head")
-        lora_module_names.remove("vision_embed_tokens")
+        if config.lora_vision:
+            lora_module_names.remove("vision_embed_tokens")
         lora_config = LoraConfig(
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
@@ -82,15 +89,15 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
     return model
 
 
-def get_data(config: Config):
-    tokenizer = transformers.AutoTokenizer.from_pretrained("adept/fuyu-8b")
+def get_data(config: Config, tokenizer):
     vocab = tokenizer.get_vocab()
     tokenizer.get_vocab = lambda: vocab
+
     processor = transformers.FuyuProcessor(
         image_processor=transformers.FuyuImageProcessor(debug=False),
         tokenizer=tokenizer,
     )
-    # processor.max_tokens_to_generate = 0
+    processor.max_tokens_to_generate = 0
     full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor)
     train_dataset, eval_dataset, _, eval_question_ids = full_ds.split(0.99)
     dataset_for_auto_eval = data.AI2DDatasetForEval(
@@ -106,17 +113,26 @@ def get_data(config: Config):
         batch_size=config.per_device_batch_size,
         pin_memory=True,
         num_workers=min(config.per_device_batch_size, 8),
+        worker_init_fn=helpers.seed_worker,
     )
-    eval_batch_size = 2
+    eval_batch_size = 4
     eval_dataloader = DataLoader(
         eval_dataset,
         shuffle=True,
         collate_fn=data_collator,
         batch_size=eval_batch_size,
         pin_memory=True,
-        # num_workers=min(eval_batch_size, 8),
+        worker_init_fn=helpers.seed_worker,
     )
-    return Data(train_dataloader, eval_dataloader, data_collator, dataset_for_auto_eval)
+    auto_eval_dataloader = DataLoader(
+        dataset_for_auto_eval,
+        batch_size=eval_batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
+        pin_memory=True,
+        worker_init_fn=helpers.seed_worker,
+    )
+    return Data(train_dataloader, eval_dataloader, data_collator, auto_eval_dataloader)
 
 
 def save_model(step, model, is_lora):
@@ -133,6 +149,9 @@ def load_model(config: Config, device="cuda:0"):
     model: transformers.FuyuForCausalLM = transformers.FuyuForCausalLM.from_pretrained(
         "adept/fuyu-8b", device_map=device, torch_dtype=torch.bfloat16
     )
+    tokenizer = transformers.AutoTokenizer.from_pretrained("adept/fuyu-8b")
+    if config.do_vocab_surgery:
+        model, tokenizer = helpers.vocab_surgery(model, tokenizer)
     checkpoint_dir = None
     if config.run_name is not None:
         run_dir = f"/home/ubuntu/fuyu/output/{config.run_name}/"
@@ -147,17 +166,18 @@ def load_model(config: Config, device="cuda:0"):
     model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
     if config.lora:
-        return get_lora_model(model, checkpoint_dir, config)
+        model = get_lora_model(model, checkpoint_dir, config)
     elif config.run_name is not None:
         raise NotImplementedError("Resuming non-finetune runs not yet implemented.")
-    return model
+    return model, tokenizer
 
 
 def train(
     model,
+    tokenizer,
     config: Config,
 ):
-    data = get_data(config)
+    data = get_data(config, tokenizer)
     max_train_steps = len(data.train_dataloader)
     opt_params = [p for n, p in model.named_parameters() if "lora" in n]
     if config.lora:
@@ -180,9 +200,19 @@ def train(
             opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
         )
     else:
-        optimizer = torch.optim.AdamW(
-            opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
-        )
+        if config.use_adafactor:
+            optimizer = transformers.Adafactor(
+                opt_group_params,
+                scale_parameter=False,
+                relative_step=False,
+                warmup_init=False,
+                clip_threshold=1.0,
+                lr=config.learning_rate,
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
+            )
 
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
@@ -193,19 +223,14 @@ def train(
 
     wandb.init(project="fuyu", config=config.__dict__)
     model = model.train()
-    losses = []
     for step, batch in enumerate(tqdm(data.train_dataloader)):
         cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
         with torch.autocast("cuda"):
             loss = model(**cleaned_batch).loss
-            losses.append(loss.item())
-        if (step + 1) % 100 == 0:
-            avg_loss = sum(losses) / len(losses)
-            print("step", step, "loss", avg_loss)
-            losses = []
         wandb.log({"step": step, "loss/train": loss})
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if not config.use_adafactor:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
@@ -222,33 +247,14 @@ def train(
 
 
 def main():
-    config = Config(
-        per_device_batch_size=2,
-        learning_rate=2e-5,
-        scheduler_type="constant",
-        warmup_steps=0,
-        lora=True,
-        lora_r=16,
-        lora_alpha=16,
-        use_8bit_optimizer=False,
-        gradient_accumulation_steps=1,
-        max_eval_steps=None,
-        train_on_questions=False,
-        run_name=None,
-        save_every_steps=500,
-        eval_every_steps=500,
-    )
-    model = load_model(config)
-    print("Loaded model.")
-    train(model, config)
-
-
-
-
-def main():
     parser = argparse.ArgumentParser(description="Training Configuration")
     for field_name, field_value in asdict(Config()).items():
-        parser.add_argument(f"--{field_name}", type=type(field_value), default=field_value)
+        if type(field_value) == bool and field_value == False:
+            parser.add_argument(f"--{field_name}", action="store_true")
+        else:
+            parser.add_argument(
+                f"--{field_name}", type=type(field_value), default=field_value
+            )
 
     args = parser.parse_args()
 
@@ -267,11 +273,16 @@ def main():
         run_name=args.run_name,
         save_every_steps=args.save_every_steps,
         eval_every_steps=args.eval_every_steps,
+        use_adafactor=args.use_adafactor,
+        weight_decay=args.weight_decay,
+        do_vocab_surgery=args.do_vocab_surgery,
+        lora_vision=args.lora_vision,
     )
-
-    model = load_model(config)
+    helpers.enforce_reproducibility()
+    model, tokenizer = load_model(config)
     print("Loaded model.")
-    train(model, config)
+    train(model, tokenizer, config)
+
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,13 @@
 import torch
+import os
 import gc
 import cProfile
+import random
+import numpy as np
+from transformers.models.fuyu import FuyuForCausalLM
+from transformers import AutoTokenizer
+import json
+from tokenizers import Tokenizer
 
 
 def clean(model_inputs, fdtype=torch.bfloat16):
@@ -44,3 +51,55 @@ def profile_function(func):
         return result
 
     return wrapper
+
+
+def enforce_reproducibility(use_seed=None):
+    seed = use_seed if use_seed is not None else random.randint(1, 1000000)
+    print(f"Using seed: {seed}")
+
+    random.seed(seed)  # python RNG
+    np.random.seed(seed)  # numpy RNG
+
+    # pytorch RNGs
+    torch.manual_seed(seed)  # cpu + cuda
+    torch.cuda.manual_seed_all(seed)  # multi-gpu - can be called without gpus
+    if use_seed:  # slower speed! https://pytorch.org/docs/stable/notes/randomness.html#cuda-convolution-benchmarking
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    return seed
+
+
+def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
+    start, end = (3, 70_003)
+    slim_tokenizer_path = "./slim-tokenizer"
+    if os.path.exists(slim_tokenizer_path):
+        tokenizer = AutoTokenizer.from_pretrained(slim_tokenizer_path)
+    else:
+        # do tokenizer surgery.
+        tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
+        vocab = tokenizer_json["model"]["vocab"]
+        new_vocab = []
+        for i, tok in enumerate(vocab):
+            if i < start or i >= end:
+                new_vocab.append(tok)
+        tokenizer_json["model"]["vocab"] = new_vocab
+        tokenizer._tokenizer = Tokenizer.from_str(json.dumps(tokenizer_json))
+        tokenizer.save_pretrained(slim_tokenizer_path)
+
+    embed = fuyu_model.language_model.model.embed_tokens.weight.detach()
+    hidden_size = embed.shape[1]
+    new_embed = torch.concat([embed[:start, :], embed[end:, :]])
+    new_vocab_size = new_embed.shape[0]
+    new_embed = torch.nn.Embedding(new_vocab_size, hidden_size, _weight=new_embed)
+    fuyu_model.language_model.model.embed_tokens = new_embed.to(fuyu_model.device)
+
+    head = fuyu_model.language_model.lm_head.weight.detach()
+    new_linear = torch.nn.Linear(hidden_size, new_vocab_size)
+    new_linear_weight = torch.concat([head[:start, :], head[end:, :]])
+    new_linear.weight.data = new_linear_weight
+    fuyu_model.language_model.lm_head = new_linear.to(fuyu_model.device)
+
+    fuyu_model.config.update(dict(vocab_size=new_vocab_size))
+    fuyu_model.language_model.config.update(dict(vocab_size=new_vocab_size))
+    return fuyu_model, tokenizer
