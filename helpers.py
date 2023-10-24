@@ -1,10 +1,13 @@
 import torch
 import gc
+import cProfile
 
 
 def clean(model_inputs, fdtype=torch.bfloat16):
     result = {}
     for k, v in model_inputs.items():
+        if k in ("is_correct", "question_id"):
+            continue
         tensor = v.to("cuda:0")
         if tensor.dtype == torch.float32 or tensor.dtype == torch.float16:
             tensor = tensor.to(fdtype)
@@ -26,3 +29,18 @@ def print_parameters(model):
             print(name.replace("0", "%d"))
         else:
             print(name)
+
+
+def profile_function(func):
+    def wrapper(*args, **kwargs):
+        profiler = cProfile.Profile()
+        profiler.enable()
+
+        result = func(*args, **kwargs)
+
+        profiler.disable()
+        profiler.dump_stats(f"{func.__name__}.prof")
+
+        return result
+
+    return wrapper
