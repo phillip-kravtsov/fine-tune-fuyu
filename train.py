@@ -90,7 +90,7 @@ def get_data(config: Config):
     )
     # processor.max_tokens_to_generate = 0
     full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor)
-    train_dataset, eval_dataset, _, eval_question_ids = full_ds.split(0.97)
+    train_dataset, eval_dataset, _, eval_question_ids = full_ds.split(0.99)
     dataset_for_auto_eval = data.AI2DDatasetForEval(
         "/home/ubuntu/ai2d", processor, eval_question_ids
     )
@@ -103,7 +103,7 @@ def get_data(config: Config):
         collate_fn=data_collator,
         batch_size=config.per_device_batch_size,
         pin_memory=True,
-        # num_workers=min(config.per_device_batch_size, 8),
+        num_workers=min(config.per_device_batch_size, 8),
     )
     eval_batch_size = 2
     eval_dataloader = DataLoader(
@@ -209,7 +209,7 @@ def train(
             save_model(step + 1, model, config.lora)
         if (step + 1) % config.eval_every_steps == 0 or step == 0:
             accuracy, eval_loss = eval.do_auto_eval(
-                model, 20, data.data_collator, data.dataset_for_auto_eval
+                model, None, data.data_collator, data.dataset_for_auto_eval
             )
             wandb.log(
                 {"step": step + 1, "accuracy/val": accuracy, "loss/val": eval_loss}
