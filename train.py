@@ -159,10 +159,11 @@ def train(
 ):
     data = get_data(config)
     max_train_steps = len(data.train_dataloader)
+    opt_params = [p for n, p in model.named_parameters() if "lora" in n]
     if config.lora:
         opt_group_params = [
             {
-                "params": [p for n, p in model.named_parameters() if "lora" in n],
+                "params": opt_params,
                 "weight_decay": 0.0,
             },
         ]
@@ -204,6 +205,7 @@ def train(
             losses = []
         wandb.log({"step": step, "loss/train": loss})
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
