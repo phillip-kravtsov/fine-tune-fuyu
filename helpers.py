@@ -4,7 +4,7 @@ import gc
 import cProfile
 import random
 import numpy as np
-from transformers.models.fuyu import FuyuForCausalLM
+from transformers.models.fuyu import FuyuForCausalLM, FuyuConfig
 from transformers import AutoTokenizer
 import json
 from tokenizers import Tokenizer
@@ -69,20 +69,21 @@ def enforce_reproducibility(use_seed=None):
 
     return seed
 
+
 def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
     start, end = (3, 70_003)
-    slim_tokenizer_path = './slim-tokenizer'
+    slim_tokenizer_path = "./slim-tokenizer"
     if os.path.exists(slim_tokenizer_path):
         tokenizer = AutoTokenizer.from_pretrained(slim_tokenizer_path)
     else:
         # do tokenizer surgery.
         tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
-        vocab = tokenizer_json['model']['vocab']
+        vocab = tokenizer_json["model"]["vocab"]
         new_vocab = []
         for i, tok in enumerate(vocab):
             if i < start or i >= end:
                 new_vocab.append(tok)
-        tokenizer_json['model']['vocab'] = new_vocab
+        tokenizer_json["model"]["vocab"] = new_vocab
         tokenizer._tokenizer = Tokenizer.from_str(json.dumps(tokenizer_json))
         tokenizer.save_pretrained(slim_tokenizer_path)
 
@@ -95,7 +96,7 @@ def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
 
     head = fuyu_model.language_model.lm_head.weight.detach()
     new_linear = torch.nn.Linear(hidden_size, new_vocab_size)
-    new_linear_weight = torch.concat([head[:start, :], head[end:,:]])
+    new_linear_weight = torch.concat([head[:start, :], head[end:, :]])
     new_linear.weight.data = new_linear_weight
     fuyu_model.language_model.lm_head = new_linear.to(fuyu_model.device)
 
@@ -103,7 +104,16 @@ def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
     fuyu_model.language_model.config.update(dict(vocab_size=new_vocab_size))
     return fuyu_model, tokenizer
 
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def estimate_activation_memory(config: FuyuConfig, s, b):
+    # no checkpointing.
+    h = config.hidden_size
+    L = config.num_hidden_layers
+    a = config.num_attention_heads
+    return (34 * h + 5 * a * s) * s * b * L

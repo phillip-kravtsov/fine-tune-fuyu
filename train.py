@@ -1,9 +1,11 @@
 import transformers
+import json
 import glob
 from collections import namedtuple
 import eval
 import os
-import data, helpers
+import data
+import helpers
 import torch
 import wandb
 from peft import get_peft_model, PeftModel
@@ -13,18 +15,18 @@ from transformers import get_scheduler
 from tqdm import tqdm
 from typing import Optional
 import argparse
-import numpy as np
-import random
-from dataclasses import asdict
 from dataclasses import dataclass, field, asdict
 import bitsandbytes as bnb
 
 grouped_question_metadata = None
 grouped_model_inputs = None
 
+OUTPUT_DIR = "/home/ubuntu/fuyu/output"
+
 
 @dataclass
 class Config:
+    model_name_or_path: str = field(default="adept/fuyu-8b")
     per_device_batch_size: int = field(default=2)
     learning_rate: float = field(default=3e-4)
     scheduler_type: str = field(default="constant")
@@ -33,7 +35,6 @@ class Config:
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=32)
     lora_vision: bool = field(default=False)
-    use_adafactor: bool = field(default=False)
     use_8bit_optimizer: bool = field(default=False)
     gradient_accumulation_steps: int = field(default=1)
     max_eval_steps: Optional[int] = field(default=None)
@@ -43,6 +44,7 @@ class Config:
     eval_every_steps: int = field(default=500)
     weight_decay: float = field(default=0.0)
     do_vocab_surgery: bool = field(default=True)
+    seed: Optional[int] = field(default=None)
 
 
 Data = namedtuple(
@@ -98,14 +100,13 @@ def get_data(config: Config, tokenizer):
         tokenizer=tokenizer,
     )
     processor.max_tokens_to_generate = 0
-    full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor)
+    instruction = "Answer the following question tersely:"
+    full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor, instruction)
     train_dataset, eval_dataset, _, eval_question_ids = full_ds.split(0.99)
-    dataset_for_auto_eval = data.AI2DDatasetForEval(
-        "/home/ubuntu/ai2d", processor, eval_question_ids
+    dataset_for_auto_eval = data.AI2DDatasetForAutoEval(
+        "/home/ubuntu/ai2d", processor, eval_question_ids, instruction
     )
-
     data_collator = data.DataCollatorForMultimodal(pad_token_id=0)
-
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
@@ -145,24 +146,28 @@ def save_model(step, model, is_lora):
     model.save_pretrained(model_path)
 
 
+def get_checkpoint_dir(run_name: str) -> str:
+    run_dir = f"/{run_name}/"
+    paths = glob.glob(os.path.join(run_dir, "step-*"))
+    steps = [p.split("-")[-1] for p in paths]
+    if "final" in steps:
+        checkpoint_dir = os.path.join(run_dir, "step-final")
+    else:
+        step = max([int(s) for s in steps])
+        checkpoint_dir = os.path.join(run_dir, f"step-{step}")
+    return checkpoint_dir
+
+
 def load_model(config: Config, device="cuda:0"):
-    model: transformers.FuyuForCausalLM = transformers.FuyuForCausalLM.from_pretrained(
-        "adept/fuyu-8b", device_map=device, torch_dtype=torch.bfloat16
+    model = transformers.FuyuForCausalLM.from_pretrained(
+        config.model_name_or_path, device_map=device, torch_dtype=torch.bfloat16
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained("adept/fuyu-8b")
     if config.do_vocab_surgery:
         model, tokenizer = helpers.vocab_surgery(model, tokenizer)
     checkpoint_dir = None
     if config.run_name is not None:
-        run_dir = f"/home/ubuntu/fuyu/output/{config.run_name}/"
-        paths = glob.glob(os.path.join(run_dir, "step-*"))
-        steps = [p.split("-")[-1] for p in paths]
-        if "final" in steps:
-            checkpoint_dir = os.path.join(run_dir, f"step-final")
-        else:
-            step = max([int(s) for s in steps])
-            checkpoint_dir = os.path.join(run_dir, f"step-{step}")
-
+        checkpoint_dir = get_checkpoint_dir(config.run_name)
     model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
     if config.lora:
@@ -170,6 +175,20 @@ def load_model(config: Config, device="cuda:0"):
     elif config.run_name is not None:
         raise NotImplementedError("Resuming non-finetune runs not yet implemented.")
     return model, tokenizer
+
+
+def load_config(run_name: str):
+    with open(f"/{OUTPUT_DIR}/{run_name}/config.json", "r") as f:
+        config = json.loads(f.read())
+    return config
+
+
+def save_config(config: Config, run_name: str):
+    run_dir = f"/{OUTPUT_DIR}/{run_name}"
+    if not os.path.exists(run_dir):
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, "config.json"), "w") as f:
+            f.write(json.dumps(asdict(config)))
 
 
 def train(
@@ -200,19 +219,9 @@ def train(
             opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
         )
     else:
-        if config.use_adafactor:
-            optimizer = transformers.Adafactor(
-                opt_group_params,
-                scale_parameter=False,
-                relative_step=False,
-                warmup_init=False,
-                clip_threshold=1.0,
-                lr=config.learning_rate,
-            )
-        else:
-            optimizer = torch.optim.AdamW(
-                opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
-            )
+        optimizer = torch.optim.AdamW(
+            opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
+        )
 
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
@@ -222,6 +231,9 @@ def train(
     )
 
     wandb.init(project="fuyu", config=config.__dict__)
+    if wandb.run is None:
+        raise Exception
+    save_config(config, wandb.run.name)
     model = model.train()
     for step, batch in enumerate(tqdm(data.train_dataloader)):
         cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
@@ -229,8 +241,7 @@ def train(
             loss = model(**cleaned_batch).loss
         wandb.log({"step": step, "loss/train": loss})
         loss.backward()
-        if not config.use_adafactor:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
@@ -249,7 +260,7 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description="Training Configuration")
     for field_name, field_value in asdict(Config()).items():
-        if type(field_value) == bool and field_value == False:
+        if isinstance(field_value, bool) and field_value is False:
             parser.add_argument(f"--{field_name}", action="store_true")
         else:
             parser.add_argument(
@@ -257,8 +268,8 @@ def main():
             )
 
     args = parser.parse_args()
-
     config = Config(
+        model_name_or_path=args.model_name_or_path,
         per_device_batch_size=args.per_device_batch_size,
         learning_rate=args.learning_rate,
         scheduler_type=args.scheduler_type,
@@ -273,12 +284,15 @@ def main():
         run_name=args.run_name,
         save_every_steps=args.save_every_steps,
         eval_every_steps=args.eval_every_steps,
-        use_adafactor=args.use_adafactor,
         weight_decay=args.weight_decay,
         do_vocab_surgery=args.do_vocab_surgery,
         lora_vision=args.lora_vision,
+        seed=args.seed,
     )
-    helpers.enforce_reproducibility()
+    if config.run_name is not None:
+        config = load_config(config.run_name)
+    seed = helpers.enforce_reproducibility(config.seed)
+    config.seed = seed
     model, tokenizer = load_model(config)
     print("Loaded model.")
     train(model, tokenizer, config)
