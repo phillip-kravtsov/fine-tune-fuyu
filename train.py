@@ -238,7 +238,7 @@ def train(
             save_model(step + 1, model, config.lora)
         if (step + 1) % config.eval_every_steps == 0:
             accuracy, eval_loss = eval.do_auto_eval(
-                model, None, data.data_collator, data.dataset_for_auto_eval
+                model, None, data.auto_eval_dataloader
             )
             wandb.log(
                 {"step": step + 1, "accuracy/val": accuracy, "loss/val": eval_loss}

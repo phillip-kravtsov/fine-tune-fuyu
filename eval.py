@@ -93,7 +93,6 @@ def do_auto_eval(model, max_questions, dataloader: DataLoader):
                 )
                 sequence_log_prob = torch.sum(selected_log_probs, dim=1)
                 probs = torch.exp(sequence_log_prob).cpu().numpy()
-                # push correct losses to losses array
             is_correct = subbatch["is_correct"].cpu().numpy()
             loss = outputs.loss.cpu().numpy()
             question_ids = subbatch["question_id"]
