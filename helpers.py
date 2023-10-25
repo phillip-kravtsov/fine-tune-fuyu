@@ -76,7 +76,6 @@ def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
     if os.path.exists(slim_tokenizer_path):
         tokenizer = AutoTokenizer.from_pretrained(slim_tokenizer_path)
     else:
-        # do tokenizer surgery.
         tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
         vocab = tokenizer_json["model"]["vocab"]
         new_vocab = []

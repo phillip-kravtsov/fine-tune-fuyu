@@ -40,11 +40,12 @@ class Config:
     max_eval_steps: Optional[int] = field(default=None)
     train_on_questions: bool = field(default=False)
     run_name: Optional[str] = field(default=None)
-    save_every_steps: int = field(default=500)
-    eval_every_steps: int = field(default=500)
-    weight_decay: float = field(default=0.0)
+    save_every_steps: int = field(default=1000)
+    eval_every_steps: int = field(default=1000)
+    weight_decay: float = field(default=0.01)
     do_vocab_surgery: bool = field(default=True)
     seed: Optional[int] = field(default=None)
+    instruction: str = field(default="")
 
 
 Data = namedtuple(
@@ -100,11 +101,10 @@ def get_data(config: Config, tokenizer):
         tokenizer=tokenizer,
     )
     processor.max_tokens_to_generate = 0
-    instruction = "Answer the following question tersely:"
-    full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor, instruction)
+    full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor, config.instruction)
     train_dataset, eval_dataset, _, eval_question_ids = full_ds.split(0.99)
     dataset_for_auto_eval = data.AI2DDatasetForAutoEval(
-        "/home/ubuntu/ai2d", processor, eval_question_ids, instruction
+        "/home/ubuntu/ai2d", processor, eval_question_ids, config.instruction
     )
     data_collator = data.DataCollatorForMultimodal(pad_token_id=0)
     train_dataloader = DataLoader(
@@ -147,7 +147,7 @@ def save_model(step, model, is_lora):
 
 
 def get_checkpoint_dir(run_name: str) -> str:
-    run_dir = f"/{run_name}/"
+    run_dir = f"{OUTPUT_DIR}/{run_name}/"
     paths = glob.glob(os.path.join(run_dir, "step-*"))
     steps = [p.split("-")[-1] for p in paths]
     if "final" in steps:
@@ -159,15 +159,15 @@ def get_checkpoint_dir(run_name: str) -> str:
 
 
 def load_model(config: Config, device="cuda:0"):
+    checkpoint_dir = None
+    if config.run_name is not None:
+        checkpoint_dir = get_checkpoint_dir(config.run_name)
     model = transformers.FuyuForCausalLM.from_pretrained(
         config.model_name_or_path, device_map=device, torch_dtype=torch.bfloat16
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained("adept/fuyu-8b")
     if config.do_vocab_surgery:
         model, tokenizer = helpers.vocab_surgery(model, tokenizer)
-    checkpoint_dir = None
-    if config.run_name is not None:
-        checkpoint_dir = get_checkpoint_dir(config.run_name)
     model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
     if config.lora:
@@ -288,6 +288,7 @@ def main():
         do_vocab_surgery=args.do_vocab_surgery,
         lora_vision=args.lora_vision,
         seed=args.seed,
+        instruction=args.instruction,
     )
     if config.run_name is not None:
         config = load_config(config.run_name)
