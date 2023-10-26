@@ -5,7 +5,6 @@ import cProfile
 import random
 import numpy as np
 from transformers.models.fuyu import FuyuForCausalLM, FuyuConfig
-from transformers import AutoTokenizer
 import json
 from tokenizers import Tokenizer
 
@@ -42,14 +41,10 @@ def profile_function(func):
     def wrapper(*args, **kwargs):
         profiler = cProfile.Profile()
         profiler.enable()
-
         result = func(*args, **kwargs)
-
         profiler.disable()
         profiler.dump_stats(f"{func.__name__}.prof")
-
         return result
-
     return wrapper
 
 
@@ -71,20 +66,17 @@ def enforce_reproducibility(use_seed=None):
 
 
 def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
+    print("Doing model surgery.")
     start, end = (3, 70_003)
-    slim_tokenizer_path = "./slim-tokenizer"
-    if os.path.exists(slim_tokenizer_path):
-        tokenizer = AutoTokenizer.from_pretrained(slim_tokenizer_path)
-    else:
-        tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
-        vocab = tokenizer_json["model"]["vocab"]
-        new_vocab = []
-        for i, tok in enumerate(vocab):
-            if i < start or i >= end:
-                new_vocab.append(tok)
-        tokenizer_json["model"]["vocab"] = new_vocab
-        tokenizer._tokenizer = Tokenizer.from_str(json.dumps(tokenizer_json))
-        tokenizer.save_pretrained(slim_tokenizer_path)
+    assert tokenizer.vocab_size == 262144, 'Not doing model surgery on a model with a different vocab size.'
+    tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
+    vocab = tokenizer_json["model"]["vocab"]
+    new_vocab = []
+    for i, tok in enumerate(vocab):
+        if i < start or i >= end:
+            new_vocab.append(tok)
+    tokenizer_json["model"]["vocab"] = new_vocab
+    tokenizer._tokenizer = Tokenizer.from_str(json.dumps(tokenizer_json))
 
     embed = fuyu_model.language_model.model.embed_tokens.weight.detach()
     hidden_size = embed.shape[1]
@@ -94,7 +86,7 @@ def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
     fuyu_model.language_model.model.embed_tokens = new_embed.to(fuyu_model.device)
 
     head = fuyu_model.language_model.lm_head.weight.detach()
-    new_linear = torch.nn.Linear(hidden_size, new_vocab_size)
+    new_linear = torch.nn.Linear(hidden_size, new_vocab_size, bias=False)
     new_linear_weight = torch.concat([head[:start, :], head[end:, :]])
     new_linear.weight.data = new_linear_weight
     fuyu_model.language_model.lm_head = new_linear.to(fuyu_model.device)

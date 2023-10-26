@@ -1,7 +1,6 @@
 import json
-import random
 from collections import OrderedDict
-from typing import Dict, Tuple, List, Set, Optional
+from typing import List, Set, Optional
 import os
 import copy
 from dataclasses import dataclass
@@ -12,20 +11,17 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import FuyuProcessor
 from tqdm import tqdm
 
-
 @dataclass
-class Question(object):
+class MultipleChoiceQuestion(object):
     image_path: str
     question: str
-    answer: str
-    question_id: str
-    is_correct: bool
+    answers: List[str]
+    correct_answer: int
+    question_id: Optional[str]
 
-
-def get_questions(
-    root_dir: str, question_ids: Optional[Set[str]], correct_only: bool
-) -> Tuple[List[Question], Dict[str, List[int]]]:
-    image_to_question_indices = {}
+def get_ai2d_questions(
+    root_dir: str, question_ids: Optional[Set[str]], skip_abc=False
+) -> List[MultipleChoiceQuestion]:
     questions = []
     questions_dir = os.path.join(root_dir, "questions")
     images_dir = os.path.join(root_dir, "images")
@@ -40,64 +36,56 @@ def get_questions(
             images_dir, image_name.replace(".png", "-abc.png")
         )
         for question_text, question_data in data["questions"].items():
-            # only care for images with questions.
-            assert os.path.exists(image_path), f"Could not find {image_path}"
-            assert os.path.exists(image_abc_path), f"Could not find {image_abc_path}"
-            question_id = question_data["questionId"]
             is_abc = question_data["abcLabel"]
+            if is_abc and skip_abc:
+                continue
+            question_id = question_data["questionId"]
             if question_ids is not None and question_id not in question_ids:
                 continue
-            for i, answer_text in enumerate(question_data["answerTexts"]):
-                if correct_only and question_data["correctAnswer"] != i:
-                    continue
-                questions.append(
-                    Question(
-                        image_path=image_path if not is_abc else image_abc_path,
-                        question=question_text,
-                        answer=answer_text,
-                        question_id=question_id,
-                        is_correct=question_data["correctAnswer"] == i,
-                    )
-                )
-                if image_name in image_to_question_indices:
-                    image_to_question_indices[image_name].append(len(questions) - 1)
-                else:
-                    image_to_question_indices[image_name] = [len(questions) - 1]
-    return questions, image_to_question_indices
+            questions.append(
+                MultipleChoiceQuestion(
+                    image_path=image_path if not is_abc else image_abc_path,
+                    question=question_text,
+                    answers=question_data["answerTexts"],
+                    correct_answer=question_data["correctAnswer"],
+                    question_id=question_id
+                ))
+    return questions
 
-
-class AI2DDataset(Dataset):
+class AI2DMultipleChoiceDataset(Dataset):
     def __init__(
-        self,
-        root_dir: str,
-        processor: FuyuProcessor,
-        instruction: Optional[str] = None,
-        include_labels: bool = True,
+            self,
+            root_dir: str,
+            processor: FuyuProcessor,
+            skip_abc=False,
+            include_labels=True,
     ):
-        self.questions: List[Question] = []
-        self.image_to_question_indices = OrderedDict()
+        self.questions: List[MultipleChoiceQuestion] = []
         self.processor = processor
         self.include_labels = include_labels
-        self.instruction = instruction
+        self.skip_abc = skip_abc
         self._init_questions(root_dir)
-
+    
     def _init_questions(self, root_dir):
-        self.questions, self.image_to_question_indices = get_questions(
-            root_dir, None, True
+        self.questions = get_ai2d_questions(
+            root_dir, None, skip_abc=self.skip_abc
         )
 
-    def __getitem__(self, idx):
+    def __len__(self):
+        return len(self.questions)
+    
+    def __getitem__(self, idx: int):
         q = self.questions[idx]
         image = Image.open(q.image_path).convert("RGB")
-        input_text = q.question + "\n"
-        if self.instruction:
-            input_text = self.instruction + " " + input_text
+        input_text = f"Answer the following multiple question: {q.question}\n Possible answers are:"
+        for answer in q.answers:
+            input_text += f"{answer}\n"
         model_inputs = self.processor(images=image, text=input_text)
         if model_inputs is None:
             raise ValueError(f"ModelInputs is none on {idx}")
         if self.include_labels:
             input_ids = model_inputs["input_ids"].squeeze()
-            target = q.answer
+            target = q.answers[q.correct_answer]
             target_ids = self.processor.tokenizer.encode(
                 target + self.processor.tokenizer.eos_token,
                 add_special_tokens=False,
@@ -109,59 +97,96 @@ class AI2DDataset(Dataset):
             labels[: input_ids.shape[0]] = -100
             model_inputs["input_ids"] = all_ids
             model_inputs["labels"] = labels
-            model_inputs["is_correct"] = q.is_correct
+            model_inputs["is_correct"] = True
             model_inputs["question_id"] = q.question_id
         return model_inputs
 
-    def __len__(self):
-        return len(self.questions)
-
     def split(
-        self, prop: float
-    ) -> Tuple["AI2DDataset", "AI2DDataset", List[str], List[str]]:
-        images = list(self.image_to_question_indices.keys())
-        random.shuffle(images)
-        idx = int(prop * len(images))
-        first_images, second_images = images[:idx], images[idx:]
-        first_indices, second_indices = [], []
-        for im in first_images:
-            first_indices.extend(self.image_to_question_indices[im])
-        for im in second_images:
-            second_indices.extend(self.image_to_question_indices[im])
-
-        first_questions = [self.questions[i].question_id for i in first_indices]
-        second_questions = [self.questions[i].question_id for i in second_indices]
+        self, test_ids: List[str]
+    ):
+        image_to_question_indices: OrderedDict[str, List[int]] = OrderedDict()
+        for i, question in enumerate(self.questions):
+            image_id = question.image_path.split('/')[-1].split('.')[0]
+            image_to_question_indices.setdefault(image_id, []).append(i)
+        images = list(image_to_question_indices.keys())
+        train_ids = [im for im in images if im not in test_ids]
+        train_idxs: List[int] = []
+        test_idxs: List[int] = []
+        for im in train_ids:
+            train_idxs.extend(image_to_question_indices[im])
+        for im in test_ids:
+            if im not in image_to_question_indices:
+                continue
+            test_idxs.extend(image_to_question_indices[im])
+        test_question_ids = [self.questions[i].question_id for i in test_idxs]
         return (
-            Subset(self, first_indices),
-            Subset(self, second_indices),
-            first_questions,
-            second_questions,
+            Subset(self, train_idxs),
+            Subset(self, test_idxs),
+            test_question_ids,
         )
 
 
-class AI2DDatasetForAutoEval(AI2DDataset):
+def get_ai2d_test_ids():
+    test_ids_csv = "/home/ubuntu/ai2d/ai2d_test_ids.csv"
+    with open(test_ids_csv, "r") as f:
+        test_ids = [line.strip() for line in f.readlines()]
+    return test_ids
+
+class AI2DDatasetForAutoEval(Dataset):
     def __init__(
         self,
         root_dir: str,
         processor: FuyuProcessor,
         question_ids: List[str],
-        instruction: Optional[str] = None,
         include_labels=True,
+        skip_abc=False,
     ):
         self.question_ids = set(question_ids)
         self.include_labels = include_labels
-        self.questions: List[Question] = []
-        self.image_to_question_indices = OrderedDict()
+        self.questions: List[MultipleChoiceQuestion] = []
         self.processor = processor
-        self.instruction = instruction
+        self.skip_abc = skip_abc
         self._init_questions(root_dir)
+        self.length = sum([len(q.answers) for q in self.questions])
+        self.answer_idx_to_question_idx = [
+            (i, j) for i, q in enumerate(self.questions) for j in range(len(q.answers))
+        ]
 
     def _init_questions(self, root_dir):
         # each question should correspond to each of the
-        self.questions, self.image_to_question_indices = get_questions(
-            root_dir, self.question_ids, False
+        self.questions = get_ai2d_questions(
+            root_dir, self.question_ids, skip_abc=self.skip_abc
         )
+    def __len__(self): 
+        return self.length
 
+    def __getitem__(self, idx: int):
+        question_idx, answer_idx = self.answer_idx_to_question_idx[idx]
+        q = self.questions[question_idx]
+        image = Image.open(q.image_path).convert("RGB")
+        input_text = f"Answer the following question: {q.question}\n Possible answers are:"
+        for answer in q.answers:
+            input_text += f"{answer}\n"
+        model_inputs = self.processor(images=image, text=input_text)
+        if model_inputs is None:
+            raise ValueError(f"ModelInputs is none on {idx}")
+        if self.include_labels:
+            input_ids = model_inputs["input_ids"].squeeze()
+            target = q.answers[answer_idx]
+            target_ids = self.processor.tokenizer.encode(
+                '\n' + target + self.processor.tokenizer.eos_token,
+                add_special_tokens=False,
+                return_tensors="pt",
+            ).squeeze()
+            # input_ids should have boa token.
+            all_ids = torch.concat([input_ids, target_ids])
+            labels = copy.deepcopy(all_ids)
+            labels[: input_ids.shape[0]] = -100
+            model_inputs["input_ids"] = all_ids
+            model_inputs["labels"] = labels
+            model_inputs["is_correct"] = q.correct_answer == answer_idx
+            model_inputs["question_id"] = q.question_id
+        return model_inputs
 
 @dataclass
 class DataCollatorForMultimodal(object):
@@ -196,9 +221,8 @@ class DataCollatorForMultimodal(object):
         return collated
 
 
-def replace_text_and_save(question: Question):
-    base_path = "/home/ubuntu/ai2d"
-    j = int(question.image_path.split(".")[0].split("/")[-1])
+def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
+    j = int(question.image_path.replace('-abc','').split(".")[0].split("/")[-1])
     impath = os.path.join(base_path, "images", f"{j}.png")
     impath_abc = os.path.join(base_path, "images", f"{j}-abc.png")
     if os.path.exists(impath_abc):
@@ -225,6 +249,6 @@ def replace_text_and_save(question: Question):
 
 
 if __name__ == "__main__":
-    questions, _ = get_questions("/home/ubuntu/ai2d", None, True)
+    questions = get_ai2d_questions("/home/ubuntu/ai2d", None, True)
     for question in tqdm(questions):
-        replace_text_and_save(question)
+        replace_text_and_save("/home/ubuntu/ai2d", question)

@@ -16,17 +16,16 @@ from tqdm import tqdm
 from typing import Optional
 import argparse
 from dataclasses import dataclass, field, asdict
+from accelerate import Accelerator
 import bitsandbytes as bnb
 
-grouped_question_metadata = None
-grouped_model_inputs = None
-
 OUTPUT_DIR = "/home/ubuntu/fuyu/output"
+ADEPT_VOCAB_SIZE = 262144
 
 
 @dataclass
 class Config:
-    model_name_or_path: str = field(default="adept/fuyu-8b")
+    model_name_or_path: str = field(default="adept/fuyu-8b-slim-vocab")
     per_device_batch_size: int = field(default=2)
     learning_rate: float = field(default=3e-4)
     scheduler_type: str = field(default="constant")
@@ -37,7 +36,7 @@ class Config:
     lora_vision: bool = field(default=False)
     use_8bit_optimizer: bool = field(default=False)
     gradient_accumulation_steps: int = field(default=1)
-    max_eval_steps: Optional[int] = field(default=None)
+    max_eval_ids: Optional[int] = field(default=500)
     train_on_questions: bool = field(default=False)
     run_name: Optional[str] = field(default=None)
     save_every_steps: int = field(default=1000)
@@ -46,6 +45,7 @@ class Config:
     do_vocab_surgery: bool = field(default=True)
     seed: Optional[int] = field(default=None)
     instruction: str = field(default="")
+    skip_abc: bool = field(default=False)
 
 
 Data = namedtuple(
@@ -95,16 +95,20 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
 def get_data(config: Config, tokenizer):
     vocab = tokenizer.get_vocab()
     tokenizer.get_vocab = lambda: vocab
-
     processor = transformers.FuyuProcessor(
         image_processor=transformers.FuyuImageProcessor(debug=False),
         tokenizer=tokenizer,
     )
     processor.max_tokens_to_generate = 0
-    full_ds = data.AI2DDataset("/home/ubuntu/ai2d", processor, config.instruction)
-    train_dataset, eval_dataset, _, eval_question_ids = full_ds.split(0.99)
+    test_ids = data.get_ai2d_test_ids()
+    if config.max_eval_ids is not None:
+        test_ids = test_ids[:config.max_eval_ids]
+    print("There are {} test ids.".format(len(test_ids)))
+    full_ds = data.AI2DMultipleChoiceDataset("/home/ubuntu/ai2d", processor, skip_abc=config.skip_abc)
+    train_dataset, eval_dataset, test_question_ids = full_ds.split(test_ids)
+    print(len(train_dataset))
     dataset_for_auto_eval = data.AI2DDatasetForAutoEval(
-        "/home/ubuntu/ai2d", processor, eval_question_ids, config.instruction
+        "/home/ubuntu/ai2d", processor, test_question_ids, skip_abc=config.skip_abc
     )
     data_collator = data.DataCollatorForMultimodal(pad_token_id=0)
     train_dataloader = DataLoader(
@@ -165,9 +169,13 @@ def load_model(config: Config, device="cuda:0"):
     model = transformers.FuyuForCausalLM.from_pretrained(
         config.model_name_or_path, device_map=device, torch_dtype=torch.bfloat16
     )
-    tokenizer = transformers.AutoTokenizer.from_pretrained("adept/fuyu-8b")
-    if config.do_vocab_surgery:
+    tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
+    if config.do_vocab_surgery and tokenizer.vocab_size == ADEPT_VOCAB_SIZE:
         model, tokenizer = helpers.vocab_surgery(model, tokenizer)
+        print("Saving surgery models")
+        tokenizer.save_pretrained('adept/fuyu-8b-slim-vocab')
+        model.save_pretrained('adept/fuyu-8b-slim-vocab')
+    
     model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
     if config.lora:
@@ -177,10 +185,10 @@ def load_model(config: Config, device="cuda:0"):
     return model, tokenizer
 
 
-def load_config(run_name: str):
+def load_config(run_name: str) -> Config:
     with open(f"/{OUTPUT_DIR}/{run_name}/config.json", "r") as f:
         config = json.loads(f.read())
-    return config
+    return Config(**config)
 
 
 def save_config(config: Config, run_name: str):
@@ -229,30 +237,37 @@ def train(
         num_warmup_steps=config.warmup_steps * config.gradient_accumulation_steps,
         num_training_steps=max_train_steps * config.gradient_accumulation_steps,
     )
-
+    accelerator = Accelerator(gradient_accumulation_steps=config.gradient_accumulation_steps, mixed_precision='bf16')
+    model, optimizer, train_dataloader = accelerator.prepare(
+        model, optimizer, data.train_dataloader
+    )
     wandb.init(project="fuyu", config=config.__dict__)
     if wandb.run is None:
         raise Exception
     save_config(config, wandb.run.name)
     model = model.train()
-    for step, batch in enumerate(tqdm(data.train_dataloader)):
+    completed_steps = 0
+    for step, batch in enumerate(tqdm(train_dataloader)):
         cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
-        with torch.autocast("cuda"):
+        with accelerator.accumulate(model):
             loss = model(**cleaned_batch).loss
-        wandb.log({"step": step, "loss/train": loss})
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        lr_scheduler.step()
-        optimizer.zero_grad()
-        if (step + 1) % config.save_every_steps == 0:
-            save_model(step + 1, model, config.lora)
-        if (step + 1) % config.eval_every_steps == 0:
+            accelerator.backward(loss)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+        if accelerator.sync_gradients:
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+            completed_steps += 1
+        wandb.log({"step": step, "loss/train": loss, "completed_steps": completed_steps})
+        if completed_steps % config.save_every_steps == 0:
+            save_model(completed_steps, model, config.lora)
+        if completed_steps % config.eval_every_steps == 0:
+            model.eval()
             accuracy, eval_loss = eval.do_auto_eval(
                 model, None, data.auto_eval_dataloader
             )
             wandb.log(
-                {"step": step + 1, "accuracy/val": accuracy, "loss/val": eval_loss}
+                {"step": completed_steps, "accuracy/val": accuracy, "loss/val": eval_loss}
             )
     save_model("final", model, config.lora)
 
@@ -279,7 +294,7 @@ def main():
         lora_alpha=args.lora_alpha,
         use_8bit_optimizer=args.use_8bit_optimizer,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        max_eval_steps=args.max_eval_steps,
+        max_eval_ids=args.max_eval_ids,
         train_on_questions=args.train_on_questions,
         run_name=args.run_name,
         save_every_steps=args.save_every_steps,
@@ -289,6 +304,7 @@ def main():
         lora_vision=args.lora_vision,
         seed=args.seed,
         instruction=args.instruction,
+        skip_abc=args.skip_abc
     )
     if config.run_name is not None:
         config = load_config(config.run_name)
