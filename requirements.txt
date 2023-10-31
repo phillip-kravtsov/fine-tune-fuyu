@@ -1,0 +1,6 @@
+wandb
+scipy
+bitsandbytes
+accelerate
+torch==2.0.1
+peft
