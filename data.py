@@ -253,23 +253,25 @@ def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
 
 
 def get_data(config: Config, tokenizer):
+    # Cache vocab for performance
     vocab = tokenizer.get_vocab()
     tokenizer.get_vocab = lambda: vocab
     processor = FuyuProcessor(
-        image_processor=FuyuImageProcessor(debug=False),
+        image_processor=FuyuImageProcessor(),
         tokenizer=tokenizer,
     )
     # This is only for training.
     processor.max_tokens_to_generate = 0
+
     test_ids = get_ai2d_test_ids()
     if config.max_eval_ids is not None:
         test_ids = test_ids[: config.max_eval_ids]
     full_ds = AI2DMultipleChoiceDataset(
         AI2D_DATA_DIR, processor, skip_abc=config.skip_abc
     )
-    train_dataset, _eval_dataset, test_question_ids = full_ds.split(test_ids)
+    train_dataset, _, test_question_ids = full_ds.split(test_ids)
     dataset_for_auto_eval = AI2DDatasetForAutoEval(
-        "/home/ubuntu/ai2d", processor, test_question_ids, skip_abc=config.skip_abc
+        AI2D_DATA_DIR, processor, test_question_ids, skip_abc=config.skip_abc
     )
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
     train_dataloader = DataLoader(
@@ -291,8 +293,10 @@ def get_data(config: Config, tokenizer):
     )
     return train_dataloader, auto_eval_dataloader
 
+def create_overlay_images():
+    questions = get_ai2d_questions(AI2D_DATA_DIR, None, False)
+    for question in tqdm(questions):
+        replace_text_and_save(AI2D_DATA_DIR, question)
 
 if __name__ == "__main__":
-    questions = get_ai2d_questions("/home/ubuntu/ai2d", None, True)
-    for question in tqdm(questions):
-        replace_text_and_save("/home/ubuntu/ai2d", question)
+    create_overlay_images()

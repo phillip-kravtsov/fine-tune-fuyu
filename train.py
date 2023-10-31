@@ -21,7 +21,6 @@ import fuyu.utils as utils
 import wandb
 
 OUTPUT_DIR = "/home/ubuntu/fuyu/output"
-ADEPT_VOCAB_SIZE = 262144
 
 
 @dataclass
@@ -118,11 +117,6 @@ def load_model(config: Config, device="cuda:0"):
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
 
-    if config.do_vocab_surgery and tokenizer.vocab_size == ADEPT_VOCAB_SIZE:
-        model, tokenizer = utils.vocab_surgery(model, tokenizer)
-        tokenizer.save_pretrained("adept/fuyu-8b-slim-vocab")
-        model.save_pretrained("adept/fuyu-8b-slim-vocab")
-
     model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
     if config.lora:
@@ -210,53 +204,58 @@ def train(
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
+    
     wandb.init(project="fuyu", config=config.__dict__)
     if wandb.run is None:
         raise Exception
     save_config(config, wandb.run.name)
-    model = model.train()
+
     completed_steps = 0
+    losses = []
     for step, batch in enumerate(tqdm(train_dataloader)):
-        cleaned_batch = utils.clean(batch, fdtype=torch.bfloat16)
+        model = model.train()
+        batch = utils.prepare_inputs(batch, fdtype=torch.bfloat16)
         with accelerator.accumulate(model):
             try:
-                loss = model(**cleaned_batch).loss
+                loss = model(**batch).loss
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                losses.append(loss.item())
             except Exception as e:
-                print(cleaned_batch["input_ids"].shape)
+                print(batch["input_ids"].shape)
                 raise e
-        wandb.log(
-            {"step": step, "loss/train": loss, "completed_steps": completed_steps}
-        )
         if accelerator.sync_gradients:
             accelerator.clip_grad_norm_(model.parameters(), 1.0)
             completed_steps += 1
+            loss = sum(losses) / len(losses)
+            wandb.log(
+                {"step": completed_steps, "loss/train": loss }
+            )
+            losses = []
             if completed_steps % config.save_every_steps == 0:
                 save_model(completed_steps, model, config.lora)
             if completed_steps % config.eval_every_steps == 0 or step == 0:
                 model.eval()
                 accuracy, eval_loss = eval.do_auto_eval(
-                    model, config.max_eval_ids, auto_eval_dataloader
+                    model, auto_eval_dataloader
                 )
-                wandb.log(
-                    {
+                wandb.log({
                         "step": completed_steps,
                         "accuracy/val": accuracy,
                         "loss/val": eval_loss,
-                    }
-                )
-    accuracy, eval_loss = eval.do_auto_eval(model, None, auto_eval_dataloader)
+                    })
+    accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
     wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
     save_model("final", model, config.lora)
 
 
 def main(config):
-    pprint.pprint(config)
     if config.run_name is not None:
+        print(f"Loading config from {config.run_name}")
         config = load_config(config.run_name)
+    pprint.pprint(config)
     seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
     model, tokenizer = load_model(config)
@@ -283,4 +282,10 @@ if __name__ == "__main__":
             parser.add_argument(f"--{name}", type=arg_type, default=default)
     args = parser.parse_args()
     config = Config(**vars(args))
-    main(config)
+    if config.do_vocab_surgery:
+        model, tokenizer = load_model(config)
+        model, tokenizer = utils.vocab_surgery(model, tokenizer)
+        tokenizer.save_pretrained("adept/fuyu-8b-slim-vocab")
+        model.save_pretrained("adept/fuyu-8b-slim-vocab")
+    else:
+        main(config)

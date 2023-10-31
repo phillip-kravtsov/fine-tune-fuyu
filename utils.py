@@ -8,14 +8,15 @@ import torch
 from tokenizers import Tokenizer
 from transformers.models.fuyu import FuyuConfig, FuyuForCausalLM
 
+ADEPT_VOCAB_SIZE = 262144
 
-def clean(model_inputs, fdtype=torch.bfloat16):
+def prepare_inputs(model_inputs, fdtype=torch.bfloat16):
     result = {}
     for k, v in model_inputs.items():
         if k in ("is_correct", "question_id"):
             continue
         tensor = v.to("cuda:0")
-        if tensor.dtype == torch.float32 or tensor.dtype == torch.float16:
+        if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16):
             tensor = tensor.to(fdtype)
         result[k] = tensor
     return result
@@ -65,12 +66,17 @@ def enforce_reproducibility(use_seed=None):
 
     return seed
 
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 
 def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
     print("Doing model surgery.")
     start, end = (3, 70_003)
     assert (
-        tokenizer.vocab_size == 262144
+        tokenizer.vocab_size == ADEPT_VOCAB_SIZE
     ), "Not doing model surgery on a model with a different vocab size."
     tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
     vocab = tokenizer_json["model"]["vocab"]
@@ -99,14 +105,7 @@ def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
     return fuyu_model, tokenizer
 
 
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
 def estimate_activation_memory(config: FuyuConfig, s, b):
-    # no checkpointing.
     h = config.hidden_size
     L = config.num_hidden_layers
     a = config.num_attention_heads
