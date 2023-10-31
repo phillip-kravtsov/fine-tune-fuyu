@@ -2,8 +2,9 @@ import argparse
 import glob
 import json
 import os
-from dataclasses import asdict, dataclass, field
-from typing import Optional
+import pprint
+from dataclasses import asdict, dataclass, field, fields
+from typing import Optional, Union, get_origin, get_args
 
 import bitsandbytes as bnb
 import torch
@@ -35,7 +36,7 @@ class Config:
     learning_rate: float = field(default=3e-4)
     scheduler_type: str = field(default="constant")
     warmup_steps: int = field(default=200)
-    lora: bool = field(default=True)
+    lora: bool = field(default=False)
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=32)
     lora_vision: bool = field(default=False)
@@ -43,13 +44,12 @@ class Config:
     gradient_accumulation_steps: int = field(default=1)
     run_name: Optional[str] = field(default=None)
     weight_decay: float = field(default=0.01)
-    do_vocab_surgery: bool = field(default=True)
+    do_vocab_surgery: bool = field(default=False)
     seed: Optional[int] = field(default=None)
     skip_abc: bool = field(default=False)
 
 
 def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
-    print("Getting lora model")
     if checkpoint_dir is not None:
         model = PeftModel.from_pretrained(
             model, os.path.join(checkpoint_dir, "adapter_model")
@@ -62,7 +62,7 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
                 lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
         lora_module_names.remove("lm_head")
-        if config.lora_vision:
+        if not config.lora_vision:
             lora_module_names.remove("vision_embed_tokens")
         lora_config = LoraConfig(
             r=config.lora_r,
@@ -89,7 +89,7 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
 
 def save_model(step, model, is_lora):
     assert wandb.run is not None
-    checkpoint_folder = f"/home/ubuntu/fuyu/output/{wandb.run.name}/step-{step}"
+    checkpoint_folder = os.path.join(OUTPUT_DIR, f"{wandb.run.name}/step-{step}")
     if is_lora:
         model_path = os.path.join(checkpoint_folder, "adapter_model")
     else:
@@ -97,7 +97,7 @@ def save_model(step, model, is_lora):
     model.save_pretrained(model_path)
 
 
-def get_checkpoint_dir(run_name: str) -> str:
+def get_latest_checkpoint_dir(run_name: str) -> str:
     run_dir = f"{OUTPUT_DIR}/{run_name}/"
     paths = glob.glob(os.path.join(run_dir, "step-*"))
     steps = [p.split("-")[-1] for p in paths]
@@ -112,14 +112,14 @@ def get_checkpoint_dir(run_name: str) -> str:
 def load_model(config: Config, device="cuda:0"):
     checkpoint_dir = None
     if config.run_name is not None:
-        checkpoint_dir = get_checkpoint_dir(config.run_name)
+        checkpoint_dir = get_latest_checkpoint_dir(config.run_name)
     model = transformers.FuyuForCausalLM.from_pretrained(
         config.model_name_or_path, device_map=device, torch_dtype=torch.bfloat16
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
+
     if config.do_vocab_surgery and tokenizer.vocab_size == ADEPT_VOCAB_SIZE:
         model, tokenizer = utils.vocab_surgery(model, tokenizer)
-        print("Saving surgery models")
         tokenizer.save_pretrained("adept/fuyu-8b-slim-vocab")
         model.save_pretrained("adept/fuyu-8b-slim-vocab")
 
@@ -193,8 +193,8 @@ def train(
     tokenizer,
     config: Config,
 ):
-    data = data_module.get_data(config, tokenizer)
-    max_train_steps = len(data.train_dataloader)
+    train_dataloader, auto_eval_dataloader = data_module.get_data(config, tokenizer)
+    max_train_steps = len(train_dataloader)
     optimizer = get_optimizer(model, config)
 
     lr_scheduler = get_scheduler(
@@ -208,7 +208,7 @@ def train(
         mixed_precision="bf16",
     )
     model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, data.train_dataloader
+        model, optimizer, train_dataloader
     )
     wandb.init(project="fuyu", config=config.__dict__)
     if wandb.run is None:
@@ -239,7 +239,7 @@ def train(
             if completed_steps % config.eval_every_steps == 0 or step == 0:
                 model.eval()
                 accuracy, eval_loss = eval.do_auto_eval(
-                    model, config.max_eval_ids, data.auto_eval_dataloader
+                    model, config.max_eval_ids, auto_eval_dataloader
                 )
                 wandb.log(
                     {
@@ -248,53 +248,39 @@ def train(
                         "loss/val": eval_loss,
                     }
                 )
-    accuracy, eval_loss = eval.do_auto_eval(model, None, data.auto_eval_dataloader)
+    accuracy, eval_loss = eval.do_auto_eval(model, None, auto_eval_dataloader)
     wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
     save_model("final", model, config.lora)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Training Configuration")
-    for field_name, field_value in asdict(Config()).items():
-        if isinstance(field_value, bool) and field_value is False:
-            parser.add_argument(f"--{field_name}", action="store_true")
-        else:
-            parser.add_argument(
-                f"--{field_name}", type=type(field_value), default=field_value
-            )
-    args = parser.parse_args()
-    config = Config(
-        model_name_or_path=args.model_name_or_path,
-        per_device_batch_size=args.per_device_batch_size,
-        learning_rate=args.learning_rate,
-        scheduler_type=args.scheduler_type,
-        warmup_steps=args.warmup_steps,
-        lora=True,  # args.lora,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        use_8bit_optimizer=args.use_8bit_optimizer,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        max_eval_ids=args.max_eval_ids,
-        train_on_questions=args.train_on_questions,
-        run_name=args.run_name,
-        save_every_steps=args.save_every_steps,
-        eval_every_steps=args.eval_every_steps,
-        weight_decay=args.weight_decay,
-        do_vocab_surgery=False,  # args.do_vocab_surgery,
-        lora_vision=args.lora_vision,
-        seed=args.seed,
-        skip_abc=args.skip_abc,
-        eval_batch_size=args.eval_batch_size,
-    )
-    print(config)
+def main(config):
+    pprint.pprint(config)
     if config.run_name is not None:
         config = load_config(config.run_name)
     seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
     model, tokenizer = load_model(config)
-    print("Loaded model.")
+    print("Loaded model, beginning training.")
     train(model, tokenizer, config)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Training Configuration")
+    for field in fields(Config):
+        name = field.name
+        default = field.default
+        field_type = field.type
+        is_optional = False
+        if get_origin(field_type) is Union:
+            arg_types = get_args(field_type)
+            is_optional = any(t == type(None) for t in arg_types)
+            actual_type = [t for t in arg_types if t != type(None)][0] if is_optional else field_type
+
+        arg_type = field_type if not is_optional else field_type.__args__[0]
+        if arg_type == bool:
+            parser.add_argument(f"--{name}", action="store_true")
+        else:
+            parser.add_argument(f"--{name}", type=arg_type, default=default)
+    args = parser.parse_args()
+    config = Config(**vars(args))
+    main(config)
