@@ -8,6 +8,7 @@ import data
 import helpers
 import torch
 import wandb
+from transformers import FuyuForCausalLM
 from peft import get_peft_model, PeftModel
 from peft.tuners.lora import LoraLayer, LoraConfig
 from torch.utils.data import DataLoader
@@ -55,6 +56,7 @@ Data = namedtuple(
 
 
 def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
+    print("Getting lora model")
     if checkpoint_dir is not None:
         model = PeftModel.from_pretrained(
             model, os.path.join(checkpoint_dir, "adapter_model")
@@ -117,7 +119,7 @@ def get_data(config: Config, tokenizer):
         collate_fn=data_collator,
         batch_size=config.per_device_batch_size,
         pin_memory=True,
-        num_workers=min(config.per_device_batch_size, 8),
+        num_workers=2,
         worker_init_fn=helpers.seed_worker,
     )
     eval_batch_size = 4
@@ -200,14 +202,22 @@ def save_config(config: Config, run_name: str):
 
 
 def train(
-    model,
+    model: FuyuForCausalLM,
     tokenizer,
     config: Config,
 ):
     data = get_data(config, tokenizer)
     max_train_steps = len(data.train_dataloader)
-    opt_params = [p for n, p in model.named_parameters() if "lora" in n]
+    def should_train(name):
+        digits =  [int(n) for n in name.split(".") if n.isdigit()]
+        if len(digits) == 0:
+            return True
+        return digits[0] % 2 == 0
+    for n, p in model.named_parameters():
+        if not should_train(n):
+            p.requires_grad = False
     if config.lora:
+        opt_params = [p for n, p in model.named_parameters() if "lora" in n]
         opt_group_params = [
             {
                 "params": opt_params,
@@ -218,19 +228,34 @@ def train(
         # todo consider (variable) weight decay
         opt_group_params = [
             {
-                "params": model.parameters(),
+                "params": [p for n, p in model.named_parameters() if should_train(n)],
                 "weight_decay": 0.0,
             }
         ]
+    def print_trainable_parameters(model):
+        """
+        Prints the number of trainable parameters in the model.
+        """
+        trainable_params = 0
+        all_param = 0
+        for _, param in model.named_parameters():
+            all_param += param.numel()
+            if param.requires_grad:
+                trainable_params += param.numel()
+        print(
+            f"trainable params: {trainable_params} || "
+            f"all params: {all_param} || "
+            f"trainable: {100 * trainable_params / all_param}"
+        )
+    print_trainable_parameters(model)
     if config.use_8bit_optimizer:
-        optimizer = bnb.optim.AdamW8bit(
-            opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
+        optimizer = bnb.optim.PagedAdamW(
+            opt_group_params, lr=config.learning_rate
         )
     else:
         optimizer = torch.optim.AdamW(
             opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
         )
-
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
         optimizer=optimizer,
@@ -250,25 +275,33 @@ def train(
     for step, batch in enumerate(tqdm(train_dataloader)):
         cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
         with accelerator.accumulate(model):
-            loss = model(**cleaned_batch).loss
-            accelerator.backward(loss)
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+            try:
+                loss = model(**cleaned_batch).loss
+                accelerator.backward(loss)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+            except Exception as e:
+                print(cleaned_batch['input_ids'].shape)
+                raise e
+        wandb.log({"step": step, "loss/train": loss, "completed_steps": completed_steps})
         if accelerator.sync_gradients:
             accelerator.clip_grad_norm_(model.parameters(), 1.0)
             completed_steps += 1
-        wandb.log({"step": step, "loss/train": loss, "completed_steps": completed_steps})
-        if completed_steps % config.save_every_steps == 0:
-            save_model(completed_steps, model, config.lora)
-        if completed_steps % config.eval_every_steps == 0:
-            model.eval()
-            accuracy, eval_loss = eval.do_auto_eval(
-                model, None, data.auto_eval_dataloader
-            )
-            wandb.log(
-                {"step": completed_steps, "accuracy/val": accuracy, "loss/val": eval_loss}
-            )
+            if completed_steps % config.save_every_steps == 0:
+                save_model(completed_steps, model, config.lora)
+            if completed_steps % config.eval_every_steps == 0 or step == 0:
+                model.eval()
+                accuracy, eval_loss = eval.do_auto_eval(
+                    model, config.max_eval_ids, data.auto_eval_dataloader
+                )
+                wandb.log(
+                    {"step": completed_steps, "accuracy/val": accuracy, "loss/val": eval_loss}
+                )
+    accuracy, eval_loss = eval.do_auto_eval(
+        model, None, data.auto_eval_dataloader
+    )
+    wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
     save_model("final", model, config.lora)
 
 
@@ -281,7 +314,6 @@ def main():
             parser.add_argument(
                 f"--{field_name}", type=type(field_value), default=field_value
             )
-
     args = parser.parse_args()
     config = Config(
         model_name_or_path=args.model_name_or_path,
@@ -289,7 +321,7 @@ def main():
         learning_rate=args.learning_rate,
         scheduler_type=args.scheduler_type,
         warmup_steps=args.warmup_steps,
-        lora=args.lora,
+        lora=True,#args.lora,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         use_8bit_optimizer=args.use_8bit_optimizer,
@@ -300,12 +332,13 @@ def main():
         save_every_steps=args.save_every_steps,
         eval_every_steps=args.eval_every_steps,
         weight_decay=args.weight_decay,
-        do_vocab_surgery=args.do_vocab_surgery,
+        do_vocab_surgery=False,#args.do_vocab_surgery,
         lora_vision=args.lora_vision,
         seed=args.seed,
         instruction=args.instruction,
         skip_abc=args.skip_abc
     )
+    print(config)
     if config.run_name is not None:
         config = load_config(config.run_name)
     seed = helpers.enforce_reproducibility(config.seed)

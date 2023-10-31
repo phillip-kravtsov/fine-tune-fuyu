@@ -52,6 +52,12 @@ def get_ai2d_questions(
                 ))
     return questions
 
+def get_input_text(question: MultipleChoiceQuestion):
+    input_text = f"Answer the following multiple choice question: {question.question}\nPossible answers are:"
+    for answer in question.answers:
+        input_text += f"{answer}\n"
+    return input_text
+
 class AI2DMultipleChoiceDataset(Dataset):
     def __init__(
             self,
@@ -77,9 +83,7 @@ class AI2DMultipleChoiceDataset(Dataset):
     def __getitem__(self, idx: int):
         q = self.questions[idx]
         image = Image.open(q.image_path).convert("RGB")
-        input_text = f"Answer the following multiple question: {q.question}\n Possible answers are:"
-        for answer in q.answers:
-            input_text += f"{answer}\n"
+        input_text = get_input_text(q)
         model_inputs = self.processor(images=image, text=input_text)
         if model_inputs is None:
             raise ValueError(f"ModelInputs is none on {idx}")
@@ -164,17 +168,13 @@ class AI2DDatasetForAutoEval(Dataset):
         question_idx, answer_idx = self.answer_idx_to_question_idx[idx]
         q = self.questions[question_idx]
         image = Image.open(q.image_path).convert("RGB")
-        input_text = f"Answer the following question: {q.question}\n Possible answers are:"
-        for answer in q.answers:
-            input_text += f"{answer}\n"
+        input_text = get_input_text(q)
         model_inputs = self.processor(images=image, text=input_text)
-        if model_inputs is None:
-            raise ValueError(f"ModelInputs is none on {idx}")
         if self.include_labels:
             input_ids = model_inputs["input_ids"].squeeze()
             target = q.answers[answer_idx]
             target_ids = self.processor.tokenizer.encode(
-                '\n' + target + self.processor.tokenizer.eos_token,
+                target + self.processor.tokenizer.eos_token,
                 add_special_tokens=False,
                 return_tensors="pt",
             ).squeeze()
