@@ -1,12 +1,12 @@
-import torch
-import os
-import gc
 import cProfile
-import random
-import numpy as np
-from transformers.models.fuyu import FuyuForCausalLM, FuyuConfig
+import gc
 import json
+import random
+
+import numpy as np
+import torch
 from tokenizers import Tokenizer
+from transformers.models.fuyu import FuyuConfig, FuyuForCausalLM
 
 
 def clean(model_inputs, fdtype=torch.bfloat16):
@@ -45,6 +45,7 @@ def profile_function(func):
         profiler.disable()
         profiler.dump_stats(f"{func.__name__}.prof")
         return result
+
     return wrapper
 
 
@@ -68,7 +69,9 @@ def enforce_reproducibility(use_seed=None):
 def vocab_surgery(fuyu_model: FuyuForCausalLM, tokenizer):
     print("Doing model surgery.")
     start, end = (3, 70_003)
-    assert tokenizer.vocab_size == 262144, 'Not doing model surgery on a model with a different vocab size.'
+    assert (
+        tokenizer.vocab_size == 262144
+    ), "Not doing model surgery on a model with a different vocab size."
     tokenizer_json = json.loads(tokenizer._tokenizer.to_str())
     vocab = tokenizer_json["model"]["vocab"]
     new_vocab = []

@@ -1,24 +1,23 @@
-import transformers
-import json
-import glob
-from collections import namedtuple
-import eval
-import os
-import data
-import helpers
-import torch
-import wandb
-from transformers import FuyuForCausalLM
-from peft import get_peft_model, PeftModel
-from peft.tuners.lora import LoraLayer, LoraConfig
-from torch.utils.data import DataLoader
-from transformers import get_scheduler
-from tqdm import tqdm
-from typing import Optional
 import argparse
-from dataclasses import dataclass, field, asdict
-from accelerate import Accelerator
+import glob
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from typing import Optional
+
 import bitsandbytes as bnb
+import torch
+import transformers
+from accelerate import Accelerator
+from peft import PeftModel, get_peft_model
+from peft.tuners.lora import LoraConfig, LoraLayer
+from tqdm import tqdm
+from transformers import FuyuForCausalLM, get_scheduler
+
+import data as data_module
+import eval
+import fuyu.utils as utils
+import wandb
 
 OUTPUT_DIR = "/home/ubuntu/fuyu/output"
 ADEPT_VOCAB_SIZE = 262144
@@ -27,6 +26,11 @@ ADEPT_VOCAB_SIZE = 262144
 @dataclass
 class Config:
     model_name_or_path: str = field(default="adept/fuyu-8b-slim-vocab")
+    max_eval_ids: Optional[int] = field(default=500)
+    train_on_questions: bool = field(default=False)
+    eval_batch_size: int = field(default=4)
+    save_every_steps: int = field(default=1000)
+    eval_every_steps: int = field(default=1000)
     per_device_batch_size: int = field(default=2)
     learning_rate: float = field(default=3e-4)
     scheduler_type: str = field(default="constant")
@@ -37,22 +41,11 @@ class Config:
     lora_vision: bool = field(default=False)
     use_8bit_optimizer: bool = field(default=False)
     gradient_accumulation_steps: int = field(default=1)
-    max_eval_ids: Optional[int] = field(default=500)
-    train_on_questions: bool = field(default=False)
     run_name: Optional[str] = field(default=None)
-    save_every_steps: int = field(default=1000)
-    eval_every_steps: int = field(default=1000)
     weight_decay: float = field(default=0.01)
     do_vocab_surgery: bool = field(default=True)
     seed: Optional[int] = field(default=None)
-    instruction: str = field(default="")
     skip_abc: bool = field(default=False)
-
-
-Data = namedtuple(
-    "Data",
-    ["train_dataloader", "eval_dataloader", "data_collator", "auto_eval_dataloader"],
-)
 
 
 def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
@@ -94,54 +87,6 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
     return model
 
 
-def get_data(config: Config, tokenizer):
-    vocab = tokenizer.get_vocab()
-    tokenizer.get_vocab = lambda: vocab
-    processor = transformers.FuyuProcessor(
-        image_processor=transformers.FuyuImageProcessor(debug=False),
-        tokenizer=tokenizer,
-    )
-    processor.max_tokens_to_generate = 0
-    test_ids = data.get_ai2d_test_ids()
-    if config.max_eval_ids is not None:
-        test_ids = test_ids[:config.max_eval_ids]
-    print("There are {} test ids.".format(len(test_ids)))
-    full_ds = data.AI2DMultipleChoiceDataset("/home/ubuntu/ai2d", processor, skip_abc=config.skip_abc)
-    train_dataset, eval_dataset, test_question_ids = full_ds.split(test_ids)
-    print(len(train_dataset))
-    dataset_for_auto_eval = data.AI2DDatasetForAutoEval(
-        "/home/ubuntu/ai2d", processor, test_question_ids, skip_abc=config.skip_abc
-    )
-    data_collator = data.DataCollatorForMultimodal(pad_token_id=0)
-    train_dataloader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=data_collator,
-        batch_size=config.per_device_batch_size,
-        pin_memory=True,
-        num_workers=2,
-        worker_init_fn=helpers.seed_worker,
-    )
-    eval_batch_size = 4
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        shuffle=True,
-        collate_fn=data_collator,
-        batch_size=eval_batch_size,
-        pin_memory=True,
-        worker_init_fn=helpers.seed_worker,
-    )
-    auto_eval_dataloader = DataLoader(
-        dataset_for_auto_eval,
-        batch_size=eval_batch_size,
-        shuffle=False,
-        collate_fn=data_collator,
-        pin_memory=True,
-        worker_init_fn=helpers.seed_worker,
-    )
-    return Data(train_dataloader, eval_dataloader, data_collator, auto_eval_dataloader)
-
-
 def save_model(step, model, is_lora):
     assert wandb.run is not None
     checkpoint_folder = f"/home/ubuntu/fuyu/output/{wandb.run.name}/step-{step}"
@@ -173,11 +118,11 @@ def load_model(config: Config, device="cuda:0"):
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
     if config.do_vocab_surgery and tokenizer.vocab_size == ADEPT_VOCAB_SIZE:
-        model, tokenizer = helpers.vocab_surgery(model, tokenizer)
+        model, tokenizer = utils.vocab_surgery(model, tokenizer)
         print("Saving surgery models")
-        tokenizer.save_pretrained('adept/fuyu-8b-slim-vocab')
-        model.save_pretrained('adept/fuyu-8b-slim-vocab')
-    
+        tokenizer.save_pretrained("adept/fuyu-8b-slim-vocab")
+        model.save_pretrained("adept/fuyu-8b-slim-vocab")
+
     model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
     if config.lora:
@@ -201,21 +146,22 @@ def save_config(config: Config, run_name: str):
             f.write(json.dumps(asdict(config)))
 
 
-def train(
-    model: FuyuForCausalLM,
-    tokenizer,
-    config: Config,
-):
-    data = get_data(config, tokenizer)
-    max_train_steps = len(data.train_dataloader)
-    def should_train(name):
-        digits =  [int(n) for n in name.split(".") if n.isdigit()]
-        if len(digits) == 0:
-            return True
-        return digits[0] % 2 == 0
-    for n, p in model.named_parameters():
-        if not should_train(n):
-            p.requires_grad = False
+# thanks to artidoro/qlora
+def print_trainable_parameters(model):
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || "
+        f"all params: {all_param} || "
+        f"trainable: {100 * trainable_params / all_param}"
+    )
+
+
+def get_optimizer(model: FuyuForCausalLM, config: Config):
     if config.lora:
         opt_params = [p for n, p in model.named_parameters() if "lora" in n]
         opt_group_params = [
@@ -228,41 +174,39 @@ def train(
         # todo consider (variable) weight decay
         opt_group_params = [
             {
-                "params": [p for n, p in model.named_parameters() if should_train(n)],
+                "params": model.parameters(),
                 "weight_decay": 0.0,
             }
         ]
-    def print_trainable_parameters(model):
-        """
-        Prints the number of trainable parameters in the model.
-        """
-        trainable_params = 0
-        all_param = 0
-        for _, param in model.named_parameters():
-            all_param += param.numel()
-            if param.requires_grad:
-                trainable_params += param.numel()
-        print(
-            f"trainable params: {trainable_params} || "
-            f"all params: {all_param} || "
-            f"trainable: {100 * trainable_params / all_param}"
-        )
     print_trainable_parameters(model)
     if config.use_8bit_optimizer:
-        optimizer = bnb.optim.PagedAdamW(
-            opt_group_params, lr=config.learning_rate
-        )
+        optimizer = bnb.optim.PagedAdamW8bit(opt_group_params, lr=config.learning_rate)
     else:
         optimizer = torch.optim.AdamW(
             opt_group_params, betas=(0.9, 0.95), lr=config.learning_rate
         )
+    return optimizer
+
+
+def train(
+    model: FuyuForCausalLM,
+    tokenizer,
+    config: Config,
+):
+    data = data_module.get_data(config, tokenizer)
+    max_train_steps = len(data.train_dataloader)
+    optimizer = get_optimizer(model, config)
+
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=config.warmup_steps * config.gradient_accumulation_steps,
         num_training_steps=max_train_steps * config.gradient_accumulation_steps,
     )
-    accelerator = Accelerator(gradient_accumulation_steps=config.gradient_accumulation_steps, mixed_precision='bf16')
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        mixed_precision="bf16",
+    )
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, data.train_dataloader
     )
@@ -273,7 +217,7 @@ def train(
     model = model.train()
     completed_steps = 0
     for step, batch in enumerate(tqdm(train_dataloader)):
-        cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
+        cleaned_batch = utils.clean(batch, fdtype=torch.bfloat16)
         with accelerator.accumulate(model):
             try:
                 loss = model(**cleaned_batch).loss
@@ -282,9 +226,11 @@ def train(
                 lr_scheduler.step()
                 optimizer.zero_grad()
             except Exception as e:
-                print(cleaned_batch['input_ids'].shape)
+                print(cleaned_batch["input_ids"].shape)
                 raise e
-        wandb.log({"step": step, "loss/train": loss, "completed_steps": completed_steps})
+        wandb.log(
+            {"step": step, "loss/train": loss, "completed_steps": completed_steps}
+        )
         if accelerator.sync_gradients:
             accelerator.clip_grad_norm_(model.parameters(), 1.0)
             completed_steps += 1
@@ -296,11 +242,13 @@ def train(
                     model, config.max_eval_ids, data.auto_eval_dataloader
                 )
                 wandb.log(
-                    {"step": completed_steps, "accuracy/val": accuracy, "loss/val": eval_loss}
+                    {
+                        "step": completed_steps,
+                        "accuracy/val": accuracy,
+                        "loss/val": eval_loss,
+                    }
                 )
-    accuracy, eval_loss = eval.do_auto_eval(
-        model, None, data.auto_eval_dataloader
-    )
+    accuracy, eval_loss = eval.do_auto_eval(model, None, data.auto_eval_dataloader)
     wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
     save_model("final", model, config.lora)
 
@@ -321,7 +269,7 @@ def main():
         learning_rate=args.learning_rate,
         scheduler_type=args.scheduler_type,
         warmup_steps=args.warmup_steps,
-        lora=True,#args.lora,
+        lora=True,  # args.lora,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         use_8bit_optimizer=args.use_8bit_optimizer,
@@ -332,16 +280,16 @@ def main():
         save_every_steps=args.save_every_steps,
         eval_every_steps=args.eval_every_steps,
         weight_decay=args.weight_decay,
-        do_vocab_surgery=False,#args.do_vocab_surgery,
+        do_vocab_surgery=False,  # args.do_vocab_surgery,
         lora_vision=args.lora_vision,
         seed=args.seed,
-        instruction=args.instruction,
-        skip_abc=args.skip_abc
+        skip_abc=args.skip_abc,
+        eval_batch_size=args.eval_batch_size,
     )
     print(config)
     if config.run_name is not None:
         config = load_config(config.run_name)
-    seed = helpers.enforce_reproducibility(config.seed)
+    seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
     model, tokenizer = load_model(config)
     print("Loaded model.")

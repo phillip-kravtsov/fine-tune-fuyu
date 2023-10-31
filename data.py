@@ -1,15 +1,23 @@
-import json
-from collections import OrderedDict
-from typing import List, Set, Optional
-import os
 import copy
+import json
+import os
+from collections import OrderedDict
 from dataclasses import dataclass
-from PIL import Image, ImageDraw, ImageFont
+from typing import List, Optional, Set
+
 import torch
-from torch.utils.data import Dataset, Subset
+from PIL import Image, ImageDraw, ImageFont
 from torch.nn.utils.rnn import pad_sequence
-from transformers import FuyuProcessor
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
+from transformers import FuyuImageProcessor, FuyuProcessor
+
+import utils
+from train import Config
+
+AI2D_DATA_DIR = "/home/ubuntu/ai2d"
+FONT_PATH = "/home/ubuntu/fuyu/Arial.ttf"
+
 
 @dataclass
 class MultipleChoiceQuestion(object):
@@ -17,7 +25,8 @@ class MultipleChoiceQuestion(object):
     question: str
     answers: List[str]
     correct_answer: int
-    question_id: Optional[str]
+    question_id: str
+
 
 def get_ai2d_questions(
     root_dir: str, question_ids: Optional[Set[str]], skip_abc=False
@@ -48,9 +57,11 @@ def get_ai2d_questions(
                     question=question_text,
                     answers=question_data["answerTexts"],
                     correct_answer=question_data["correctAnswer"],
-                    question_id=question_id
-                ))
+                    question_id=question_id,
+                )
+            )
     return questions
+
 
 def get_input_text(question: MultipleChoiceQuestion):
     input_text = f"Answer the following multiple choice question: {question.question}\nPossible answers are:"
@@ -58,28 +69,48 @@ def get_input_text(question: MultipleChoiceQuestion):
         input_text += f"{answer}\n"
     return input_text
 
+
+def get_ai2d_test_ids():
+    test_ids_csv_path = os.path.join(AI2D_DATA_DIR, "ai2d_test_ids.csv")
+    with open(test_ids_csv_path, "r") as f:
+        test_ids = [line.strip() for line in f.readlines()]
+    return test_ids
+
+
+def add_labels_to_model_inputs(model_inputs, tokenizer, target):
+    input_ids = model_inputs["input_ids"].squeeze()
+    target_ids = tokenizer.encode(
+        target + tokenizer.eos_token,
+        add_special_tokens=False,
+        return_tensors="pt",
+    ).squeeze()
+    all_ids = torch.concat([input_ids, target_ids])
+    labels = copy.deepcopy(all_ids)
+    labels[: input_ids.shape[0]] = -100
+    model_inputs["input_ids"] = all_ids
+    model_inputs["labels"] = labels
+
+
 class AI2DMultipleChoiceDataset(Dataset):
     def __init__(
-            self,
-            root_dir: str,
-            processor: FuyuProcessor,
-            skip_abc=False,
-            include_labels=True,
+        self,
+        root_dir: str,
+        processor: FuyuProcessor,
+        skip_abc=False,
+        include_labels=True,
     ):
         self.questions: List[MultipleChoiceQuestion] = []
         self.processor = processor
         self.include_labels = include_labels
         self.skip_abc = skip_abc
         self._init_questions(root_dir)
-    
+
     def _init_questions(self, root_dir):
-        self.questions = get_ai2d_questions(
-            root_dir, None, skip_abc=self.skip_abc
-        )
+        self.questions = get_ai2d_questions(root_dir, None, skip_abc=self.skip_abc)
 
     def __len__(self):
         return len(self.questions)
-    
+
     def __getitem__(self, idx: int):
         q = self.questions[idx]
         image = Image.open(q.image_path).convert("RGB")
@@ -88,29 +119,16 @@ class AI2DMultipleChoiceDataset(Dataset):
         if model_inputs is None:
             raise ValueError(f"ModelInputs is none on {idx}")
         if self.include_labels:
-            input_ids = model_inputs["input_ids"].squeeze()
             target = q.answers[q.correct_answer]
-            target_ids = self.processor.tokenizer.encode(
-                target + self.processor.tokenizer.eos_token,
-                add_special_tokens=False,
-                return_tensors="pt",
-            ).squeeze()
-            # input_ids should have boa token.
-            all_ids = torch.concat([input_ids, target_ids])
-            labels = copy.deepcopy(all_ids)
-            labels[: input_ids.shape[0]] = -100
-            model_inputs["input_ids"] = all_ids
-            model_inputs["labels"] = labels
             model_inputs["is_correct"] = True
             model_inputs["question_id"] = q.question_id
+            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
         return model_inputs
 
-    def split(
-        self, test_ids: List[str]
-    ):
+    def split(self, test_ids: List[str]):
         image_to_question_indices: OrderedDict[str, List[int]] = OrderedDict()
         for i, question in enumerate(self.questions):
-            image_id = question.image_path.split('/')[-1].split('.')[0]
+            image_id = question.image_path.split("/")[-1].split(".")[0]
             image_to_question_indices.setdefault(image_id, []).append(i)
         images = list(image_to_question_indices.keys())
         train_ids = [im for im in images if im not in test_ids]
@@ -129,12 +147,6 @@ class AI2DMultipleChoiceDataset(Dataset):
             test_question_ids,
         )
 
-
-def get_ai2d_test_ids():
-    test_ids_csv = "/home/ubuntu/ai2d/ai2d_test_ids.csv"
-    with open(test_ids_csv, "r") as f:
-        test_ids = [line.strip() for line in f.readlines()]
-    return test_ids
 
 class AI2DDatasetForAutoEval(Dataset):
     def __init__(
@@ -157,11 +169,11 @@ class AI2DDatasetForAutoEval(Dataset):
         ]
 
     def _init_questions(self, root_dir):
-        # each question should correspond to each of the
         self.questions = get_ai2d_questions(
             root_dir, self.question_ids, skip_abc=self.skip_abc
         )
-    def __len__(self): 
+
+    def __len__(self):
         return self.length
 
     def __getitem__(self, idx: int):
@@ -170,23 +182,15 @@ class AI2DDatasetForAutoEval(Dataset):
         image = Image.open(q.image_path).convert("RGB")
         input_text = get_input_text(q)
         model_inputs = self.processor(images=image, text=input_text)
+        if model_inputs is None:
+            raise ValueError(f"ModelInputs is none on {idx}")
         if self.include_labels:
-            input_ids = model_inputs["input_ids"].squeeze()
             target = q.answers[answer_idx]
-            target_ids = self.processor.tokenizer.encode(
-                target + self.processor.tokenizer.eos_token,
-                add_special_tokens=False,
-                return_tensors="pt",
-            ).squeeze()
-            # input_ids should have boa token.
-            all_ids = torch.concat([input_ids, target_ids])
-            labels = copy.deepcopy(all_ids)
-            labels[: input_ids.shape[0]] = -100
-            model_inputs["input_ids"] = all_ids
-            model_inputs["labels"] = labels
             model_inputs["is_correct"] = q.correct_answer == answer_idx
             model_inputs["question_id"] = q.question_id
+            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
         return model_inputs
+
 
 @dataclass
 class DataCollatorForMultimodal(object):
@@ -222,7 +226,7 @@ class DataCollatorForMultimodal(object):
 
 
 def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
-    j = int(question.image_path.replace('-abc','').split(".")[0].split("/")[-1])
+    j = int(question.image_path.replace("-abc", "").split(".")[0].split("/")[-1])
     impath = os.path.join(base_path, "images", f"{j}.png")
     impath_abc = os.path.join(base_path, "images", f"{j}-abc.png")
     if os.path.exists(impath_abc):
@@ -241,11 +245,51 @@ def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
         top_left = tuple(value["rectangle"][0])
         bottom_right = tuple(value["rectangle"][1])
         rectangle_height = bottom_right[1] - top_left[1]
-        font = ImageFont.truetype("/home/ubuntu/fuyu/Arial.ttf", rectangle_height)
+        font = ImageFont.truetype(FONT_PATH, rectangle_height)
         draw.rectangle([top_left, bottom_right], fill=(255, 255, 255))
         replacement_text = value["replacementText"]
         draw.text(top_left, replacement_text, font=font, fill=(0, 0, 0))
     img.save(impath_abc)
+
+
+def get_data(config: Config, tokenizer):
+    vocab = tokenizer.get_vocab()
+    tokenizer.get_vocab = lambda: vocab
+    processor = FuyuProcessor(
+        image_processor=FuyuImageProcessor(debug=False),
+        tokenizer=tokenizer,
+    )
+    # This is only for training.
+    processor.max_tokens_to_generate = 0
+    test_ids = get_ai2d_test_ids()
+    if config.max_eval_ids is not None:
+        test_ids = test_ids[: config.max_eval_ids]
+    full_ds = AI2DMultipleChoiceDataset(
+        AI2D_DATA_DIR, processor, skip_abc=config.skip_abc
+    )
+    train_dataset, _eval_dataset, test_question_ids = full_ds.split(test_ids)
+    dataset_for_auto_eval = AI2DDatasetForAutoEval(
+        "/home/ubuntu/ai2d", processor, test_question_ids, skip_abc=config.skip_abc
+    )
+    data_collator = DataCollatorForMultimodal(pad_token_id=0)
+    train_dataloader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=data_collator,
+        batch_size=config.per_device_batch_size,
+        pin_memory=True,
+        num_workers=2,
+        worker_init_fn=utils.seed_worker,
+    )
+    auto_eval_dataloader = DataLoader(
+        dataset_for_auto_eval,
+        batch_size=config.eval_batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
+        pin_memory=True,
+        worker_init_fn=utils.seed_worker,
+    )
+    return train_dataloader, auto_eval_dataloader
 
 
 if __name__ == "__main__":

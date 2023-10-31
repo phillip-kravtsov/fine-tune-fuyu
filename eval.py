@@ -1,9 +1,11 @@
 from collections import defaultdict
-import helpers
+
 import torch
-import wandb
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+import fuyu.utils as utils
+import wandb
 
 
 def do_eval(model, step, max_steps, eval_dataloader):
@@ -13,7 +15,7 @@ def do_eval(model, step, max_steps, eval_dataloader):
     for i, batch in enumerate(tqdm(eval_dataloader, total=max_steps)):
         if max_steps is not None and i > max_steps:
             break
-        cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
+        cleaned_batch = utils.clean(batch, fdtype=torch.bfloat16)
         with torch.inference_mode(), torch.autocast("cuda"):
             loss = model(**cleaned_batch).loss
         losses.append(loss.item())
@@ -75,7 +77,7 @@ def do_auto_eval(model, max_questions, dataloader: DataLoader):
         for subbatch in subbatches:
             with torch.inference_mode(), torch.autocast("cuda"):
                 try:
-                    outputs = model(**helpers.clean(subbatch))
+                    outputs = model(**utils.clean(subbatch))
                 except Exception as e:
                     print(subbatch["input_ids"].shape)
                     raise e
