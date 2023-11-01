@@ -13,10 +13,10 @@ from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
 
 import utils
-from train import Config
+from config import Config
 
 AI2D_DATA_DIR = "/workspace/ai2d"
-FONT_PATH = "/home/ubuntu/fuyu/Arial.ttf"
+FONT_PATH = "/workspace/Arial.ttf"
 
 
 @dataclass

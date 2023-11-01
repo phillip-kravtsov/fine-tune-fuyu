@@ -4,6 +4,7 @@ import glob
 import json
 import os
 import pprint
+from config import Config
 from dataclasses import asdict, dataclass, field, fields
 from typing import Optional, Union, get_origin, get_args
 import torch.distributed as dist
@@ -19,6 +20,11 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
 )
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+        CheckpointImpl,
+        apply_activation_checkpointing,
+    )
 
 import bitsandbytes as bnb
 import torch
@@ -35,30 +41,6 @@ import wandb
 
 OUTPUT_DIR = "/root/fuyu/output"
 
-
-@dataclass
-class Config:
-    model_name_or_path: str = field(default="adept/fuyu-8b-slim-vocab")
-    max_eval_ids: Optional[int] = field(default=500)
-    train_on_questions: bool = field(default=False)
-    eval_batch_size: int = field(default=4)
-    save_every_steps: int = field(default=1000)
-    eval_every_steps: int = field(default=1000)
-    per_device_batch_size: int = field(default=2)
-    learning_rate: float = field(default=3e-4)
-    scheduler_type: str = field(default="constant")
-    warmup_steps: int = field(default=200)
-    lora: bool = field(default=False)
-    lora_r: int = field(default=32)
-    lora_alpha: int = field(default=32)
-    lora_vision: bool = field(default=False)
-    use_8bit_optimizer: bool = field(default=False)
-    gradient_accumulation_steps: int = field(default=1)
-    run_name: Optional[str] = field(default=None)
-    weight_decay: float = field(default=0.01)
-    do_vocab_surgery: bool = field(default=False)
-    seed: Optional[int] = field(default=None)
-    skip_abc: bool = field(default=False)
 
 
 def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
@@ -131,13 +113,13 @@ def load_model(config: Config):
     checkpoint_dir = None
     if config.run_name is not None:
         checkpoint_dir = get_latest_checkpoint_dir(config.run_name)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
     model = transformers.FuyuForCausalLM.from_pretrained(
         config.model_name_or_path, torch_dtype=torch.bfloat16
     )
-    tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
 
-    model.gradient_checkpointing_enable()
     model.language_model.model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable()
     for name, module in model.named_modules():
         if hasattr(module, 'weight') and module.weight.dtype != torch.bfloat16:
             print(name)
@@ -200,8 +182,8 @@ def get_optimizer(model: FuyuForCausalLM, config: Config):
     if config.use_8bit_optimizer:
         optimizer = bnb.optim.PagedAdamW8bit(opt_group_params, lr=config.learning_rate)
     else:
-        optimizer = torch.optim.SGD(
-            opt_group_params, momentum=0.95, lr=config.learning_rate
+        optimizer = torch.optim.Adadelta(
+            opt_group_params, lr=config.learning_rate
         )
     return optimizer
 
@@ -221,13 +203,16 @@ def train(
     max_train_steps = len(train_dataloader)
     optimizer = get_optimizer(model, config)
     from transformers.models.persimmon.modeling_persimmon import PersimmonDecoderLayer
+    import functools
+
+    #auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=10_000_000)
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
             PersimmonDecoderLayer,
         },
     )
-
+    from torch.distributed.fsdp import CPUOffload
     fsdp_config = dict(
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -239,9 +224,17 @@ def train(
         ),
         backward_prefetch=None,
         param_init_fn=None,
-        cpu_offload=None,
+        cpu_offload=CPUOffload(offload_params=True),
     )
     model = FSDP(model, **fsdp_config)
+    if local_rank == 0:
+        print(model)
+    """
+    non_reentrant_wrapper = functools.partial(checkpoint_wrapper, offload_to_cpu=False, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+    apply_activation_checkpointing(
+            model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn = lambda x: isinstance(x, PersimmonDecoderLayer)
+    )
+    """
 
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
@@ -272,10 +265,16 @@ def train(
         model = model.train()
         print(local_rank, torch.cuda.memory_allocated() / 1e9, 'GB')
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
-        loss = model(**batch).loss
-        loss.backward()
-        optimizer.step()
-        lr_scheduler.step()
+        try:
+            loss = model(**batch).loss
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+        except Exception as e:
+            print('---------')
+            print(batch['input_ids'].shape)
+            print('---------')
+            raise e
         optimizer.zero_grad(set_to_none=True)
         loss = loss.detach()
         loss  = get_all_reduce_mean(loss).item()
@@ -310,7 +309,8 @@ def main(config, local_rank, world_size):
     if config.run_name is not None:
         print(f"Loading config from {config.run_name}")
         config = load_config(config.run_name)
-    pprint.pprint(config)
+    if local_rank == 0:
+        pprint.pprint(config)
     seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
     model, tokenizer = load_model(config)
@@ -338,10 +338,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = Config(**vars(args))
     if config.do_vocab_surgery:
+        config.lora = False
         model, tokenizer = load_model(config)
+        print('doing vocab surgery')
         model, tokenizer = utils.vocab_surgery(model, tokenizer)
-        tokenizer.save_pretrained("adept/fuyu-8b-slim-vocab")
-        model.save_pretrained("adept/fuyu-8b-slim-vocab")
+        print(model)
+        print('saving surgery model')
+        tokenizer.save_pretrained("fuyu-8b-slim-vocab")
+        model.save_pretrained("fuyu-8b-slim-vocab")
+        exit(0)
     else:
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
