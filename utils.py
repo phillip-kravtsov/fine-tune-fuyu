@@ -10,12 +10,12 @@ from transformers.models.fuyu import FuyuConfig, FuyuForCausalLM
 
 ADEPT_VOCAB_SIZE = 262144
 
-def prepare_inputs(model_inputs, fdtype=torch.bfloat16):
+def prepare_inputs(model_inputs, device, fdtype=torch.bfloat16):
     result = {}
     for k, v in model_inputs.items():
         if k in ("is_correct", "question_id"):
             continue
-        tensor = v.to("cuda:0")
+        tensor = v.to(device)
         if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16):
             tensor = tensor.to(fdtype)
         result[k] = tensor

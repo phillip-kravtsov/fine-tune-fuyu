@@ -8,14 +8,14 @@ from typing import List, Optional, Set
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, DistributedSampler
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
 
 import utils
 from train import Config
 
-AI2D_DATA_DIR = "/home/ubuntu/ai2d"
+AI2D_DATA_DIR = "/workspace/ai2d"
 FONT_PATH = "/home/ubuntu/fuyu/Arial.ttf"
 
 
@@ -252,7 +252,7 @@ def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
     img.save(impath_abc)
 
 
-def get_data(config: Config, tokenizer):
+def get_data(config: Config, world_size, local_rank, tokenizer):
     # Cache vocab for performance
     vocab = tokenizer.get_vocab()
     tokenizer.get_vocab = lambda: vocab
@@ -274,19 +274,25 @@ def get_data(config: Config, tokenizer):
         AI2D_DATA_DIR, processor, test_question_ids, skip_abc=config.skip_abc
     )
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
+    sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=local_rank,
+            shuffle=True,
+            seed=102,
+    )
     train_dataloader = DataLoader(
         train_dataset,
-        shuffle=True,
         collate_fn=data_collator,
         batch_size=config.per_device_batch_size,
         pin_memory=True,
         num_workers=2,
+        sampler=sampler,
         worker_init_fn=utils.seed_worker,
     )
     auto_eval_dataloader = DataLoader(
         dataset_for_auto_eval,
         batch_size=config.eval_batch_size,
-        shuffle=False,
         collate_fn=data_collator,
         pin_memory=True,
         worker_init_fn=utils.seed_worker,
