@@ -286,9 +286,9 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
         collate_fn=data_collator,
         batch_size=config.per_device_batch_size,
         pin_memory=True,
-        num_workers=2,
+        num_workers=4,
         sampler=sampler,
-        worker_init_fn=utils.seed_worker,
+        #worker_init_fn=utils.seed_worker,
     )
     auto_eval_dataloader = DataLoader(
         dataset_for_auto_eval,

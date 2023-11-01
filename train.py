@@ -1,3 +1,4 @@
+import gc
 import argparse
 import functools
 import glob
@@ -13,11 +14,13 @@ import torch.distributed as dist
 import transformers
 from peft import PeftModel, get_peft_model
 from peft.tuners.lora import LoraConfig
+from torch.cuda import _memory_viz
 from torch.distributed.fsdp import FullStateDictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, StateDictType
 from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.profiler import ProfilerActivity, profile, record_function
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
 
@@ -102,7 +105,7 @@ def load_model(config: Config):
         checkpoint_dir = get_latest_checkpoint_dir(config.run_name)
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
     model = transformers.FuyuForCausalLM.from_pretrained(
-        config.model_name_or_path, torch_dtype=torch.bfloat16
+        config.model_name_or_path, torch_dtype=torch.bfloat16,
     )
 
     model.language_model.model.gradient_checkpointing_enable()
@@ -151,25 +154,10 @@ def print_trainable_parameters(model):
 def get_optimizer(model: FuyuForCausalLM, config: Config):
     if config.lora:
         opt_params = [p for n, p in model.named_parameters() if "lora" in n]
-        opt_group_params = [
-            {
-                "params": opt_params,
-                "weight_decay": 0.0,
-            },
-        ]
     else:
-        # todo consider (variable) weight decay
-        opt_group_params = [
-            {
-                "params": model.parameters(),
-                "weight_decay": 0.0,
-            }
-        ]
+        opt_params = model.parameters()
     print_trainable_parameters(model)
-    if config.use_8bit_optimizer:
-        optimizer = bnb.optim.PagedAdamW8bit(opt_group_params, lr=config.learning_rate)
-    else:
-        optimizer = torch.optim.Adadelta(opt_group_params, lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(opt_params, foreach=False, lr=config.learning_rate)
     return optimizer
 
 
@@ -180,70 +168,71 @@ def get_all_reduce_mean(tensor):
 
 
 def train(
-    model: FuyuForCausalLM,
+    model: torch.nn.Module,
     tokenizer,
     config: Config,
     local_rank,
     world_size,
 ):
+    tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
     train_dataloader, auto_eval_dataloader = data_module.get_data(
         config, world_size=world_size, local_rank=local_rank, tokenizer=tokenizer
     )
     max_train_steps = len(train_dataloader)
-    optimizer = get_optimizer(model, config)
-    import functools
 
-    from transformers.models.persimmon.modeling_persimmon import \
-        PersimmonDecoderLayer
+    wrap_policy_type = "transformer"
+    if wrap_policy_type == "transformer":
+        from transformers.models.persimmon.modeling_persimmon import \
+            PersimmonDecoderLayer, PersimmonOutputEmbedding, PersimmonEmbedTokens
+        from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
 
-    # auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=10_000_000)
-    auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            PersimmonDecoderLayer,
-        },
-    )
-    from torch.distributed.fsdp import CPUOffload
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={
+                FuyuVisionEmbedTokens,
+                PersimmonEmbedTokens,
+                PersimmonDecoderLayer,
+                PersimmonOutputEmbedding,
+            },
+        )
+    else:
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+        auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy, min_num_params=1000_000
+        )
 
-    fsdp_config = dict(
+    from torch.distributed.fsdp.api import CPUOffload
+
+    model, tokenizer = load_model(config)
+    print("after loading model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
+    model = FSDP(
+        model,
+        limit_all_gathers=True,
+        cpu_offload=None,#CPUOffload(offload_params=True),
+        backward_prefetch=None,
+        param_init_fn=None,
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
+        use_orig_params=True,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
-        backward_prefetch=None,
-        param_init_fn=None,
-        cpu_offload=CPUOffload(offload_params=True),
     )
-    model = FSDP(model, **fsdp_config)
+    print("after fsdp model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
+    optimizer = get_optimizer(model, config)
+    print("after optimizer model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
     if local_rank == 0:
         print(model)
-    """
-    non_reentrant_wrapper = functools.partial(checkpoint_wrapper, offload_to_cpu=False, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
-    apply_activation_checkpointing(
-            model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn = lambda x: isinstance(x, PersimmonDecoderLayer)
-    )
-    """
-
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=config.warmup_steps * config.gradient_accumulation_steps,
         num_training_steps=max_train_steps * config.gradient_accumulation_steps,
     )
-    """
-    accelerator = Accelerator(
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        mixed_precision="bf16",
-    )
-    model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader
-    )
-    """
-    if local_rank == 0:
+    if local_rank == 0 and False:
         wandb.init(project="fuyu", config=config.__dict__)
         if wandb.run is None:
             raise Exception
@@ -253,21 +242,23 @@ def train(
     losses = []
     model.train()
     dist.barrier()
-    for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
-        model = model.train()
-        print(local_rank, torch.cuda.memory_allocated() / 1e9, "GB")
+    def step_fn(batch):
+        nonlocal model
+        nonlocal losses
+        nonlocal completed_steps
+        #print('prestep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
         try:
             loss = model(**batch).loss
+            #print('preback', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
             loss.backward()
             optimizer.step()
+            #print('postoptstep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
+            optimizer.zero_grad()
             lr_scheduler.step()
         except Exception as e:
-            print("---------")
-            print(batch["input_ids"].shape)
-            print("---------")
+            print(batch['input_ids'].shape)
             raise e
-        optimizer.zero_grad(set_to_none=True)
         loss = loss.detach()
         loss = get_all_reduce_mean(loss).item()
         if local_rank == 0:
@@ -276,7 +267,8 @@ def train(
         completed_steps += 1
         if local_rank == 0:
             loss = sum(losses) / len(losses)
-            wandb.log({"step": completed_steps, "loss/train": loss})
+            if wandb.run is not None:
+                wandb.log({"step": completed_steps, "loss/train": loss})
             losses = []
         if completed_steps % config.save_every_steps == 0:
             save_model(completed_steps, model, config.lora)
@@ -290,6 +282,30 @@ def train(
                     "loss/val": eval_loss,
                 }
             )
+    with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
+        for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
+            retry = False
+            try:
+                step_fn(batch)
+            except torch.cuda.OutOfMemoryError:
+                retry = True
+            if retry:
+                gc.collect()
+                torch.cuda.memory.empty_cache()
+                step_fn(batch)
+            if step > 0:
+                break
+    print('Exporting chrome trace.')
+    prof.export_chrome_trace(
+        f"traces/trace_{local_rank}.json"
+    )
+    print(
+        f"Exporting memory timeline after step."
+    )
+    prof.export_memory_timeline(
+        f"timelines/memory_timeline_{local_rank}.html", f"cuda:{local_rank}"
+    )
+    exit(0)
     accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
     wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
     save_model("final", model, config.lora)
@@ -303,9 +319,9 @@ def main(config, local_rank, world_size):
         pprint.pprint(config)
     seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
-    model, tokenizer = load_model(config)
+    #model, tokenizer = load_model(config)
     print("Loaded model, beginning training.")
-    train(model, tokenizer, config, local_rank, world_size)
+    train(None, None, config, local_rank, world_size)
 
 
 if __name__ == "__main__":
