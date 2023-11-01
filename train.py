@@ -1,6 +1,6 @@
-import gc
 import argparse
 import functools
+import gc
 import glob
 import json
 import os
@@ -105,7 +105,8 @@ def load_model(config: Config):
         checkpoint_dir = get_latest_checkpoint_dir(config.run_name)
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
     model = transformers.FuyuForCausalLM.from_pretrained(
-        config.model_name_or_path, torch_dtype=torch.bfloat16,
+        config.model_name_or_path,
+        torch_dtype=torch.bfloat16,
     )
 
     model.language_model.model.gradient_checkpointing_enable()
@@ -182,9 +183,11 @@ def train(
 
     wrap_policy_type = "transformer"
     if wrap_policy_type == "transformer":
-        from transformers.models.persimmon.modeling_persimmon import \
-            PersimmonDecoderLayer, PersimmonOutputEmbedding, PersimmonEmbedTokens
-        from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
+        from transformers.models.fuyu.modeling_fuyu import \
+            FuyuVisionEmbedTokens
+        from transformers.models.persimmon.modeling_persimmon import (
+            PersimmonDecoderLayer, PersimmonEmbedTokens,
+            PersimmonOutputEmbedding)
 
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
@@ -197,6 +200,7 @@ def train(
         )
     else:
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+
         auto_wrap_policy = functools.partial(
             size_based_auto_wrap_policy, min_num_params=1000_000
         )
@@ -208,7 +212,7 @@ def train(
     model = FSDP(
         model,
         limit_all_gathers=True,
-        cpu_offload=None,#CPUOffload(offload_params=True),
+        cpu_offload=None,  # CPUOffload(offload_params=True),
         backward_prefetch=None,
         param_init_fn=None,
         auto_wrap_policy=auto_wrap_policy,
@@ -242,22 +246,23 @@ def train(
     losses = []
     model.train()
     dist.barrier()
+
     def step_fn(batch):
         nonlocal model
         nonlocal losses
         nonlocal completed_steps
-        #print('prestep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
+        # print('prestep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
         try:
             loss = model(**batch).loss
-            #print('preback', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
+            # print('preback', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
             loss.backward()
             optimizer.step()
-            #print('postoptstep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
+            # print('postoptstep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
             optimizer.zero_grad()
             lr_scheduler.step()
         except Exception as e:
-            print(batch['input_ids'].shape)
+            print(batch["input_ids"].shape)
             raise e
         loss = loss.detach()
         loss = get_all_reduce_mean(loss).item()
@@ -282,6 +287,7 @@ def train(
                     "loss/val": eval_loss,
                 }
             )
+
     with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
         for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
             retry = False
@@ -295,13 +301,9 @@ def train(
                 step_fn(batch)
             if step > 0:
                 break
-    print('Exporting chrome trace.')
-    prof.export_chrome_trace(
-        f"traces/trace_{local_rank}.json"
-    )
-    print(
-        f"Exporting memory timeline after step."
-    )
+    print("Exporting chrome trace.")
+    prof.export_chrome_trace(f"traces/trace_{local_rank}.json")
+    print(f"Exporting memory timeline after step.")
     prof.export_memory_timeline(
         f"timelines/memory_timeline_{local_rank}.html", f"cuda:{local_rank}"
     )
@@ -319,7 +321,7 @@ def main(config, local_rank, world_size):
         pprint.pprint(config)
     seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
-    #model, tokenizer = load_model(config)
+    # model, tokenizer = load_model(config)
     print("Loaded model, beginning training.")
     train(None, None, config, local_rank, world_size)
 

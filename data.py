@@ -288,7 +288,7 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
         pin_memory=True,
         num_workers=4,
         sampler=sampler,
-        #worker_init_fn=utils.seed_worker,
+        # worker_init_fn=utils.seed_worker,
     )
     auto_eval_dataloader = DataLoader(
         dataset_for_auto_eval,
