@@ -45,6 +45,7 @@ def get_subbatches(batch, batch_size):
         subbatches = [batch]
     return subbatches
 
+
 def get_label_probs(logits: torch.Tensor, labels: torch.Tensor):
     shifted_logits = logits[:, :-1, :].contiguous()
     shifted_labels = labels[..., 1:].contiguous().cuda()
@@ -54,9 +55,7 @@ def get_label_probs(logits: torch.Tensor, labels: torch.Tensor):
     selected_log_probs = torch.gather(
         log_probs, 2, gather_indices.unsqueeze(-1)
     ).squeeze(-1)
-    selected_log_probs = torch.where(
-        non_ignore_indices, selected_log_probs, 0.0
-    )
+    selected_log_probs = torch.where(non_ignore_indices, selected_log_probs, 0.0)
     sequence_log_prob = torch.sum(selected_log_probs, dim=1)
     probs = torch.exp(sequence_log_prob).cpu().numpy()
     return probs
@@ -66,6 +65,7 @@ def do_auto_eval(model, dataloader: DataLoader):
     results_by_question_id = defaultdict(list)
     losses = []
     model.eval()
+
     def compute_accuracy():
         correct_by_question_id = {}
         for question_id, results in results_by_question_id.items():
@@ -87,7 +87,7 @@ def do_auto_eval(model, dataloader: DataLoader):
                 except Exception as e:
                     print(subbatch["input_ids"].shape)
                     raise e
-                probs = get_label_probs(outputs.logits, subbatch['labels'])
+                probs = get_label_probs(outputs.logits, subbatch["labels"])
             is_correct = subbatch["is_correct"].cpu().numpy()
             loss = outputs.loss.cpu().numpy()
             question_ids = subbatch["question_id"]

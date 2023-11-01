@@ -1,5 +1,6 @@
-from typing import *
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field
+from typing import Optional
+
 
 @dataclass
 class Config:
@@ -24,4 +25,3 @@ class Config:
     do_vocab_surgery: bool = field(default=False)
     seed: Optional[int] = field(default=None)
     skip_abc: bool = field(default=False)
-

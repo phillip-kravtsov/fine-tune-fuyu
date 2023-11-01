@@ -10,6 +10,7 @@ from transformers.models.fuyu import FuyuConfig, FuyuForCausalLM
 
 ADEPT_VOCAB_SIZE = 262144
 
+
 def prepare_inputs(model_inputs, device, fdtype=torch.bfloat16):
     result = {}
     for k, v in model_inputs.items():
@@ -65,6 +66,7 @@ def enforce_reproducibility(use_seed=None):
         torch.backends.cudnn.benchmark = False
 
     return seed
+
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32

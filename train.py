@@ -4,33 +4,20 @@ import glob
 import json
 import os
 import pprint
-from config import Config
 from dataclasses import asdict, dataclass, field, fields
-from typing import Optional, Union, get_origin, get_args
-import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    FullStateDictConfig,
-    StateDictType,
-)
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    ShardingStrategy,
-)
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy,
-)
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-        checkpoint_wrapper,
-        CheckpointImpl,
-        apply_activation_checkpointing,
-    )
+from typing import Optional, Union, get_args, get_origin
 
 import bitsandbytes as bnb
 import torch
+import torch.distributed as dist
 import transformers
 from peft import PeftModel, get_peft_model
-from peft.tuners.lora import LoraConfig, LoraLayer
+from peft.tuners.lora import LoraConfig
+from torch.distributed.fsdp import FullStateDictConfig
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, StateDictType
+from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
 
@@ -38,9 +25,9 @@ import data as data_module
 import eval
 import utils
 import wandb
+from config import Config
 
 OUTPUT_DIR = "/root/fuyu/output"
-
 
 
 def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
@@ -71,7 +58,7 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
         model = get_peft_model(model, lora_config)
 
     for name, module in model.named_modules():
-        if hasattr(module, 'weight') and module.weight.dtype != torch.bfloat16:
+        if hasattr(module, "weight") and module.weight.dtype != torch.bfloat16:
             print(name)
             module.to(torch.bfloat16)
         """
@@ -121,7 +108,7 @@ def load_model(config: Config):
     model.language_model.model.gradient_checkpointing_enable()
     model.gradient_checkpointing_enable()
     for name, module in model.named_modules():
-        if hasattr(module, 'weight') and module.weight.dtype != torch.bfloat16:
+        if hasattr(module, "weight") and module.weight.dtype != torch.bfloat16:
             print(name)
             module.to(torch.bfloat16)
 
@@ -182,15 +169,15 @@ def get_optimizer(model: FuyuForCausalLM, config: Config):
     if config.use_8bit_optimizer:
         optimizer = bnb.optim.PagedAdamW8bit(opt_group_params, lr=config.learning_rate)
     else:
-        optimizer = torch.optim.Adadelta(
-            opt_group_params, lr=config.learning_rate
-        )
+        optimizer = torch.optim.Adadelta(opt_group_params, lr=config.learning_rate)
     return optimizer
+
 
 def get_all_reduce_mean(tensor):
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
     tensor = tensor / torch.distributed.get_world_size()
     return tensor
+
 
 def train(
     model: FuyuForCausalLM,
@@ -199,13 +186,17 @@ def train(
     local_rank,
     world_size,
 ):
-    train_dataloader, auto_eval_dataloader = data_module.get_data(config, world_size=world_size, local_rank=local_rank, tokenizer=tokenizer)
+    train_dataloader, auto_eval_dataloader = data_module.get_data(
+        config, world_size=world_size, local_rank=local_rank, tokenizer=tokenizer
+    )
     max_train_steps = len(train_dataloader)
     optimizer = get_optimizer(model, config)
-    from transformers.models.persimmon.modeling_persimmon import PersimmonDecoderLayer
     import functools
 
-    #auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=10_000_000)
+    from transformers.models.persimmon.modeling_persimmon import \
+        PersimmonDecoderLayer
+
+    # auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=10_000_000)
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
@@ -213,6 +204,7 @@ def train(
         },
     )
     from torch.distributed.fsdp import CPUOffload
+
     fsdp_config = dict(
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -263,7 +255,7 @@ def train(
     dist.barrier()
     for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
         model = model.train()
-        print(local_rank, torch.cuda.memory_allocated() / 1e9, 'GB')
+        print(local_rank, torch.cuda.memory_allocated() / 1e9, "GB")
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
         try:
             loss = model(**batch).loss
@@ -271,35 +263,33 @@ def train(
             optimizer.step()
             lr_scheduler.step()
         except Exception as e:
-            print('---------')
-            print(batch['input_ids'].shape)
-            print('---------')
+            print("---------")
+            print(batch["input_ids"].shape)
+            print("---------")
             raise e
         optimizer.zero_grad(set_to_none=True)
         loss = loss.detach()
-        loss  = get_all_reduce_mean(loss).item()
+        loss = get_all_reduce_mean(loss).item()
         if local_rank == 0:
             losses.append(loss)
 
         completed_steps += 1
         if local_rank == 0:
             loss = sum(losses) / len(losses)
-            wandb.log(
-                {"step": completed_steps, "loss/train": loss }
-            )
+            wandb.log({"step": completed_steps, "loss/train": loss})
             losses = []
         if completed_steps % config.save_every_steps == 0:
             save_model(completed_steps, model, config.lora)
         if completed_steps % config.eval_every_steps == 0:
             model.eval()
-            accuracy, eval_loss = eval.do_auto_eval(
-                model, auto_eval_dataloader
-            )
-            wandb.log({
+            accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
+            wandb.log(
+                {
                     "step": completed_steps,
                     "accuracy/val": accuracy,
                     "loss/val": eval_loss,
-                })
+                }
+            )
     accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
     wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
     save_model("final", model, config.lora)
@@ -328,7 +318,11 @@ if __name__ == "__main__":
         if get_origin(field_type) is Union:
             arg_types = get_args(field_type)
             is_optional = any(t == type(None) for t in arg_types)
-            actual_type = [t for t in arg_types if t != type(None)][0] if is_optional else field_type
+            actual_type = (
+                [t for t in arg_types if t != type(None)][0]
+                if is_optional
+                else field_type
+            )
 
         arg_type = field_type if not is_optional else field_type.__args__[0]
         if arg_type == bool:
@@ -340,10 +334,10 @@ if __name__ == "__main__":
     if config.do_vocab_surgery:
         config.lora = False
         model, tokenizer = load_model(config)
-        print('doing vocab surgery')
+        print("doing vocab surgery")
         model, tokenizer = utils.vocab_surgery(model, tokenizer)
         print(model)
-        print('saving surgery model')
+        print("saving surgery model")
         tokenizer.save_pretrained("fuyu-8b-slim-vocab")
         model.save_pretrained("fuyu-8b-slim-vocab")
         exit(0)

@@ -8,7 +8,7 @@ from typing import List, Optional, Set
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, Subset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
 
@@ -275,11 +275,11 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
     )
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
     sampler = DistributedSampler(
-            train_dataset,
-            num_replicas=world_size,
-            rank=local_rank,
-            shuffle=True,
-            seed=102,
+        train_dataset,
+        num_replicas=world_size,
+        rank=local_rank,
+        shuffle=True,
+        seed=102,
     )
     train_dataloader = DataLoader(
         train_dataset,
@@ -299,10 +299,12 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
     )
     return train_dataloader, auto_eval_dataloader
 
+
 def create_overlay_images():
     questions = get_ai2d_questions(AI2D_DATA_DIR, None, False)
     for question in tqdm(questions):
         replace_text_and_save(AI2D_DATA_DIR, question)
+
 
 if __name__ == "__main__":
     create_overlay_images()
