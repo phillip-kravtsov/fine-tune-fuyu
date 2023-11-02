@@ -113,10 +113,12 @@ def load_model(config: Config):
     if config.run_name is not None:
         checkpoint_dir = get_latest_checkpoint_dir(config.run_name)
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
-    model = transformers.FuyuForCausalLM.from_pretrained(
+    model: transformers.FuyuForCausalLM = transformers.FuyuForCausalLM.from_pretrained(
         config.model_name_or_path,
         torch_dtype=torch.bfloat16,
     )
+    model.config.use_cache=False
+    model.language_model.config.use_cache=False
 
     model.language_model.model.gradient_checkpointing_enable()
     model.gradient_checkpointing_enable()
@@ -190,29 +192,28 @@ def train(
     )
     max_train_steps = len(train_dataloader)
 
-    wrap_policy_type = "transformer"
-    if wrap_policy_type == "transformer":
-        from transformers.models.fuyu.modeling_fuyu import \
-            FuyuVisionEmbedTokens
-        from transformers.models.persimmon.modeling_persimmon import (
-            PersimmonDecoderLayer, PersimmonEmbedTokens,
-            PersimmonOutputEmbedding)
+    from transformers.models.fuyu.modeling_fuyu import \
+        FuyuVisionEmbedTokens
+    from transformers.models.persimmon.modeling_persimmon import (
+        PersimmonDecoderLayer, PersimmonEmbedTokens,
+        PersimmonOutputEmbedding)
 
-        auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                FuyuVisionEmbedTokens,
-                PersimmonEmbedTokens,
-                PersimmonDecoderLayer,
-                PersimmonOutputEmbedding,
-            },
-        )
-    else:
-        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+    auto_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={
+            FuyuVisionEmbedTokens,
+            PersimmonEmbedTokens,
+            PersimmonDecoderLayer,
+            PersimmonOutputEmbedding,
+        },
+    )
+    """
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
-        auto_wrap_policy = functools.partial(
-            size_based_auto_wrap_policy, min_num_params=1000_000
-        )
+    auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy, min_num_params=1000_000
+    )
+    """
 
     from torch.distributed.fsdp.api import CPUOffload
 
@@ -221,7 +222,7 @@ def train(
     model = FSDP(
         model,
         limit_all_gathers=True,
-        cpu_offload=CPUOffload(offload_params=False),
+        cpu_offload=None,#CPUOffload(offload_params=True),
         backward_prefetch=None,
         param_init_fn=None,
         auto_wrap_policy=auto_wrap_policy,
@@ -237,8 +238,10 @@ def train(
     print("after fsdp model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
     optimizer = get_optimizer(model, config)
     print("after optimizer model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
+
     if local_rank == 0:
         print(model)
+
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
         optimizer=optimizer,
