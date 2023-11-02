@@ -2,7 +2,6 @@ from collections import defaultdict
 
 import torch
 import torch.distributed as dist
-from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -48,7 +47,7 @@ def get_subbatches(batch, batch_size):
     return subbatches
 
 
-def get_label_probs(logits: torch.Tensor, labels: torch.Tensor):
+def get_label_log_probs(logits: torch.Tensor, labels: torch.Tensor):
     shifted_logits = logits[:, :-1, :].contiguous()
     shifted_labels = labels[..., 1:].contiguous().cuda()
     log_probs = torch.nn.functional.log_softmax(shifted_logits, dim=-1)
@@ -89,7 +88,7 @@ def do_auto_eval(model, dataloader: DataLoader):
                 except Exception as e:
                     print(subbatch["input_ids"].shape)
                     raise e
-                probs = get_label_probs(outputs.logits, subbatch["labels"])
+                probs = get_label_log_probs(outputs.logits, subbatch["labels"])
             is_correct = subbatch["is_correct"].cpu().numpy()
             loss = outputs.loss.cpu().numpy()
             question_ids = subbatch["question_id"]
@@ -102,6 +101,7 @@ def do_auto_eval(model, dataloader: DataLoader):
 
 
 def auto_eval_dist(model, dataloader, rank, world_size):
+    model.eval()
     id_tensors = []
     probs_tensors = []
     is_correct_tensors = []
@@ -117,14 +117,12 @@ def auto_eval_dist(model, dataloader, rank, world_size):
                 except torch.cuda.OutOfMemoryError as e:
                     print(subbatch["input_ids"].shape)
                     raise e
-                probs = get_label_probs(outputs.logits.float(), subbatch["labels"])
+                probs = get_label_log_probs(outputs.logits.float(), subbatch["labels"])
             is_correct = subbatch["is_correct"]
             question_ids = subbatch["question_id"]
             id_tensors.append(question_ids)
             is_correct_tensors.append(is_correct)
             probs_tensors.append(probs)
-        if i > 15:
-            break
     flat_probs = torch.cat(probs_tensors).to(rank)  # Should not be necessary.
     flat_ids = torch.cat(id_tensors).to(rank)
     flat_correct = torch.cat(is_correct_tensors).to(rank)

@@ -5,22 +5,26 @@ import glob
 import json
 import os
 import pprint
-from dataclasses import asdict, dataclass, field, fields
-from typing import Optional, Union, get_args, get_origin
+import time
+from dataclasses import asdict, field, fields
+from typing import Union, get_args, get_origin
 
-import bitsandbytes as bnb
 import torch
 import torch.distributed as dist
 import transformers
 from peft import PeftModel, get_peft_model
-from peft.tuners.lora import LoraConfig
-from torch.cuda import _memory_viz
-from torch.distributed.fsdp import FullStateDictConfig
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision, StateDictType
-from torch.distributed.fsdp.fully_sharded_data_parallel import ShardingStrategy
+from peft.tuners.lora import LoraConfig, LoraLayer
+from torch.distributed.fsdp.api import (
+    FullStateDictConfig,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullyShardedDataParallel as FSDP,
+)
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.profiler import ProfilerActivity, profile, record_function
+from torch.profiler import profile
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
 
@@ -30,12 +34,11 @@ import utils
 import wandb
 from config import Config
 
-OUTPUT_DIR = "/root/fuyu/output"
+OUTPUT_DIR = "/workspace/fuyu/output"
 
 
-def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
-    assert config.lora
-    if checkpoint_dir is not None:
+def get_lora_model(model, checkpoint_dir: str, config: Config):
+    if os.path.exists(os.path.join(checkpoint_dir, "adapter_model")):
         model = PeftModel.from_pretrained(
             model, os.path.join(checkpoint_dir, "adapter_model")
         )
@@ -45,7 +48,6 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
             if isinstance(module, torch.nn.Linear):
                 names = name.split(".")
                 lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
         lora_module_names.remove("lm_head")
         if not config.lora_vision:
             lora_module_names.remove("vision_embed_tokens")
@@ -57,14 +59,12 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
             bias="none",
             task_type="CAUSAL_LM",
         )
-
         model = get_peft_model(model, lora_config)
 
     for name, module in model.named_modules():
         if hasattr(module, "weight") and module.weight.dtype != torch.bfloat16:
             print(name)
             module.to(torch.bfloat16)
-        """
         if isinstance(module, LoraLayer):
             module = module.to(torch.bfloat16)
         if "norm" in name:
@@ -73,33 +73,49 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
             if hasattr(module, "weight"):
                 if module.weight.dtype == torch.float32:
                     module = module.to(torch.bfloat16)
-        """
     return model
 
 
-def save_model(step, model, tokenizer, is_lora):
-    if is_lora:
+def get_checkpoint_dir(step, run_name=None):
+    if run_name is None:
         assert wandb.run is not None
-        checkpoint_folder = os.path.join(OUTPUT_DIR, f"{wandb.run.name}/step-{step}")
-        model_path = os.path.join(checkpoint_folder, "adapter_model")
-        model.save_pretrained(model_path)
-        tokenizer.save_pretrained(checkpoint_folder)
-    else:
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-            cpu_state = model.state_dict()
-        if local_rank == 0:
-            assert wandb.run is not None
-            checkpoint_folder = os.path.join(
-                OUTPUT_DIR, f"{wandb.run.name}/step-{step}"
-            )
-            print("Saving model.")
-            model.save_pretrained(checkpoint_folder, state_dict=cpu_state)
-            tokenizer.save_pretrained(checkpoint_folder)
+        run_name = wandb.run.name
+    return os.path.join(OUTPUT_DIR, f"{run_name}/step-{step}")
+
+
+def get_run_dir(run_name=None):
+    if run_name is None:
+        assert wandb.run is not None
+        run_name = wandb.run.name
+    return os.path.join(OUTPUT_DIR, f"{wandb.run.name}")
+
+
+def save_lora_model(step, model, tokenizer):
+    model_path = os.path.join(get_checkpoint_dir(step), "adapter_model")
+    model.save_pretrained(model_path)
+    tokenizer.save_pretrained(get_checkpoint_dir(step))
+
+
+def save_fsdp_model(step, model, tokenizer):
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        cpu_state = model.state_dict()
+    if local_rank == 0:
+        print("Saving model.")
+        model.save_pretrained(get_checkpoint_dir(step), state_dict=cpu_state)
+        tokenizer.save_pretrained(get_checkpoint_dir(step))
+
+
+def save_model(step, model, tokenizer, is_lora):
+    return (
+        save_lora_model(step, model, tokenizer)
+        if is_lora
+        else save_fsdp_model(step, model, tokenizer)
+    )
 
 
 def get_latest_checkpoint_dir(run_name: str) -> str:
-    run_dir = f"{OUTPUT_DIR}/{run_name}/"
+    run_dir = get_run_dir(run_name)
     paths = glob.glob(os.path.join(run_dir, "step-*"))
     steps = [p.split("-")[-1] for p in paths]
     if "final" in steps:
@@ -111,33 +127,35 @@ def get_latest_checkpoint_dir(run_name: str) -> str:
 
 
 def load_model(config: Config):
-    checkpoint_dir = None
+    model_path = config.model_name_or_path
     if config.run_name is not None:
-        checkpoint_dir = get_latest_checkpoint_dir(config.run_name)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
+        model_path = get_latest_checkpoint_dir(config.run_name)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+    fuyu_config = transformers.FuyuConfig(use_flash_attn=config.use_flash_attn)
     model: transformers.FuyuForCausalLM = transformers.FuyuForCausalLM.from_pretrained(
-        config.model_name_or_path,
+        model_path,
+        config=fuyu_config,
         torch_dtype=torch.bfloat16,
     )
-    model.config.use_cache = False
+    # Avoid conflicts with gradient checkpointing.
     model.language_model.config.use_cache = False
-
+    model.config.use_cache = False
     model.language_model.model.gradient_checkpointing_enable()
     model.gradient_checkpointing_enable()
+
     for name, module in model.named_modules():
-        if hasattr(module, "weight") and module.weight.dtype != torch.bfloat16:
-            print(name)
-            module.to(torch.bfloat16)
+        if hasattr(module, "weight"):
+            assert module.weight.dtype == torch.bfloat16, f"{name} is not bfloat16"
 
     if config.lora:
-        model = get_lora_model(model, checkpoint_dir, config)
+        model = get_lora_model(model, model_path, config)
     elif config.run_name is not None:
         raise NotImplementedError("Resuming non-finetune runs not yet implemented.")
     return model, tokenizer
 
 
 def load_config(run_name: str) -> Config:
-    with open(f"/{OUTPUT_DIR}/{run_name}/config.json", "r") as f:
+    with open(f"{OUTPUT_DIR}/{run_name}/config.json", "r") as f:
         config = json.loads(f.read())
     return Config(**config)
 
@@ -150,40 +168,26 @@ def save_config(config: Config, run_name: str):
             f.write(json.dumps(asdict(config)))
 
 
-# thanks to artidoro/qlora
-def print_trainable_parameters(model):
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || "
-        f"all params: {all_param} || "
-        f"trainable: {100 * trainable_params / all_param}"
-    )
-
-
-def get_optimizer(model: FuyuForCausalLM, config: Config):
+def get_optimizer(model: Union[FuyuForCausalLM, FSDP, PeftModel], config: Config):
     if config.lora:
         opt_params = [p for n, p in model.named_parameters() if "lora" in n]
     else:
         opt_params = model.parameters()
-    print_trainable_parameters(model)
+    utils.print_trainable_parameters(model)
     optimizer = torch.optim.AdamW(opt_params, foreach=False, lr=config.learning_rate)
     return optimizer
 
 
-def get_all_reduce_mean(tensor):
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
-    tensor = tensor / torch.distributed.get_world_size()
-    return tensor
+def export_profile(prof, local_rank):
+    print("Exporting chrome trace.")
+    prof.export_chrome_trace(f"traces/trace_{local_rank}.json")
+    print("Exporting memory timeline.")
+    prof.export_memory_timeline(
+        f"timelines/memory_timeline_{local_rank}.html", f"cuda:{local_rank}"
+    )
 
 
 def train(
-    model: torch.nn.Module,
-    tokenizer,
     config: Config,
     local_rank,
     world_size,
@@ -196,7 +200,10 @@ def train(
 
     from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
     from transformers.models.persimmon.modeling_persimmon import (
-        PersimmonDecoderLayer, PersimmonEmbedTokens, PersimmonOutputEmbedding)
+        PersimmonDecoderLayer,
+        PersimmonEmbedTokens,
+        PersimmonOutputEmbedding,
+    )
 
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
@@ -207,22 +214,12 @@ def train(
             PersimmonOutputEmbedding,
         },
     )
-    """
-    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-
-    auto_wrap_policy = functools.partial(
-        size_based_auto_wrap_policy, min_num_params=1000_000
-    )
-    """
-
-    from torch.distributed.fsdp.api import CPUOffload
 
     model, tokenizer = load_model(config)
-    print("after loading model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
     model = FSDP(
         model,
         limit_all_gathers=True,
-        cpu_offload=None,  # CPUOffload(offload_params=True),
+        cpu_offload=None,
         backward_prefetch=None,
         param_init_fn=None,
         auto_wrap_policy=auto_wrap_policy,
@@ -235,19 +232,17 @@ def train(
             buffer_dtype=torch.bfloat16,
         ),
     )
-    print("after fsdp model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
     optimizer = get_optimizer(model, config)
-    print("after optimizer model", torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
-
     if local_rank == 0:
         print(model)
 
     lr_scheduler = get_scheduler(
         name=config.scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=config.warmup_steps * config.gradient_accumulation_steps,
-        num_training_steps=max_train_steps * config.gradient_accumulation_steps,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=max_train_steps,
     )
+
     if local_rank == 0:
         wandb.init(project="fuyu", config=config.__dict__)
         if wandb.run is None:
@@ -255,13 +250,11 @@ def train(
         save_config(config, wandb.run.name)
 
     completed_steps = 0
-    losses = []
     model.train()
     dist.barrier()
 
     def step_fn(batch):
         nonlocal model
-        nonlocal losses
         nonlocal completed_steps
         model.train()
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
@@ -272,56 +265,60 @@ def train(
             optimizer.step()
             optimizer.zero_grad()
             lr_scheduler.step()
-        except Exception as e:
-            print(batch["input_ids"].shape)
+        except torch.cuda.OutOfMemoryError as e:
+            print("OOM on inputs with shape", batch["input_ids"].shape)
             raise e
         loss = loss.detach()
-        loss = get_all_reduce_mean(loss).item()
-        if local_rank == 0:
-            losses.append(loss)
-
+        loss = utils.get_all_reduce_mean(loss).item()
         completed_steps += 1
         if local_rank == 0:
-            loss = sum(losses) / len(losses)
             if wandb.run is not None:
                 wandb.log({"step": completed_steps, "loss/train": loss})
-            losses = []
+
         if completed_steps % config.save_every_steps == 0:
             save_model(completed_steps, model, tokenizer, config.lora)
+
         if completed_steps % config.eval_every_steps == 0 or completed_steps == 1:
-            model.eval()
             accuracy = eval.auto_eval_dist(
                 model, auto_eval_dataloader, local_rank, world_size
             )
             if local_rank == 0 and accuracy is not None:
-                wandb.log(
-                    {
-                        "step": completed_steps,
-                        "accuracy/val": accuracy,
-                    }
-                )
+                wandb.log({"step": completed_steps, "accuracy/val": accuracy})
 
-    # with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
-    for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
-        gc.collect()
-        torch.cuda.memory.empty_cache()
-        step_fn(batch)
-    """
-    print("Exporting chrome trace.")
-    prof.export_chrome_trace(f"traces/trace_{local_rank}.json")
-    print(f"Exporting memory timeline after step.")
-    prof.export_memory_timeline(
-        f"timelines/memory_timeline_{local_rank}.html", f"cuda:{local_rank}"
-    )
-    """
-    accuracy = eval.auto_eval_dist(model, auto_eval_dataloader, local_rank, world_size)
-    if local_rank == 0:
-        wandb.log(
-            {
-                "accuracy/final": accuracy,
-            }
+    start_time = time.time()
+
+    def log_throughput():
+        nonlocal start_time
+        nonlocal completed_steps
+        if completed_steps % 10 == 0 and local_rank == 0:
+            end_time = time.time()
+            throughput = 10 / (end_time - start_time)
+            print(f"Throughput: {throughput} steps/sec")
+            wandb.log({"step": completed_steps, "throughput": throughput})
+            start_time = time.time()
+
+    if config.profile:
+        with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
+            for batch in tqdm(train_dataloader, disable=(local_rank != 0)):
+                gc.collect()
+                torch.cuda.memory.empty_cache()
+                step_fn(batch)
+                if completed_steps >= 10:
+                    log_throughput()
+                    break
+        export_profile(prof, local_rank)
+    else:
+        for batch in tqdm(train_dataloader, disable=(local_rank != 0)):
+            gc.collect()
+            torch.cuda.memory.empty_cache()
+            step_fn(batch)
+            log_throughput()
+        accuracy = eval.auto_eval_dist(
+            model, auto_eval_dataloader, local_rank, world_size
         )
-    save_model("final", model, tokenizer, config.lora)
+        if local_rank == 0:
+            wandb.log({"accuracy/final": accuracy})
+        save_model("final", model, tokenizer, config.lora)
 
 
 def main(config, local_rank, world_size):
@@ -332,8 +329,7 @@ def main(config, local_rank, world_size):
         pprint.pprint(config)
     seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
-    # model, tokenizer = load_model(config)
-    train(None, None, config, local_rank, world_size)
+    train(config, local_rank, world_size)
 
 
 if __name__ == "__main__":
@@ -357,9 +353,12 @@ if __name__ == "__main__":
             parser.add_argument(f"--{name}", action="store_true")
         else:
             parser.add_argument(f"--{name}", type=arg_type, default=default)
+
     args = parser.parse_args()
     config = Config(**vars(args))
+
     if config.do_vocab_surgery:
+        # Todo move to another file
         config.lora = False
         model, tokenizer = load_model(config)
         print("doing vocab surgery")

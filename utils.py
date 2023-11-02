@@ -112,3 +112,24 @@ def estimate_activation_memory(config: FuyuConfig, s, b):
     L = config.num_hidden_layers
     a = config.num_attention_heads
     return (34 * h + 5 * a * s) * s * b * L
+
+
+# thanks to artidoro/qlora
+def print_trainable_parameters(model):
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || "
+        f"all params: {all_param} || "
+        f"trainable: {100 * trainable_params / all_param}"
+    )
+
+
+def get_all_reduce_mean(tensor):
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    tensor = tensor / torch.distributed.get_world_size()
+    return tensor
