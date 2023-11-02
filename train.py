@@ -77,14 +77,23 @@ def get_lora_model(model, checkpoint_dir: Optional[str], config: Config):
     return model
 
 
-def save_model(step, model, is_lora):
-    assert wandb.run is not None
-    checkpoint_folder = os.path.join(OUTPUT_DIR, f"{wandb.run.name}/step-{step}")
+def save_model(step, model, tokenizer, is_lora):
     if is_lora:
+        assert wandb.run is not None
+        checkpoint_folder = os.path.join(OUTPUT_DIR, f"{wandb.run.name}/step-{step}")
         model_path = os.path.join(checkpoint_folder, "adapter_model")
+        model.save_pretrained(model_path)
+        tokenizer.save_pretrained(checkpoint_folder)
     else:
-        model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
-    model.save_pretrained(model_path)
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            cpu_state = model.state_dict()
+        if local_rank == 0:
+            assert wandb.run is not None
+            checkpoint_folder = os.path.join(OUTPUT_DIR, f"{wandb.run.name}/step-{step}")
+            print("Saving model.")
+            model.save_pretrained(checkpoint_folder, state_dict=cpu_state)
+            tokenizer.save_pretrained(checkpoint_folder)
 
 
 def get_latest_checkpoint_dir(run_name: str) -> str:
@@ -212,7 +221,7 @@ def train(
     model = FSDP(
         model,
         limit_all_gathers=True,
-        cpu_offload=None,  # CPUOffload(offload_params=True),
+        cpu_offload=CPUOffload(offload_params=False),
         backward_prefetch=None,
         param_init_fn=None,
         auto_wrap_policy=auto_wrap_policy,
@@ -236,7 +245,7 @@ def train(
         num_warmup_steps=config.warmup_steps * config.gradient_accumulation_steps,
         num_training_steps=max_train_steps * config.gradient_accumulation_steps,
     )
-    if local_rank == 0 and False:
+    if local_rank == 0:
         wandb.init(project="fuyu", config=config.__dict__)
         if wandb.run is None:
             raise Exception
@@ -251,14 +260,12 @@ def train(
         nonlocal model
         nonlocal losses
         nonlocal completed_steps
-        # print('prestep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
         try:
             loss = model(**batch).loss
-            # print('preback', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
             loss.backward()
+            model.clip_grad_norm_(1.0)
             optimizer.step()
-            # print('postoptstep', torch.cuda.memory_allocated(local_rank) / 1e9, "GB")
             optimizer.zero_grad()
             lr_scheduler.step()
         except Exception as e:
@@ -276,7 +283,7 @@ def train(
                 wandb.log({"step": completed_steps, "loss/train": loss})
             losses = []
         if completed_steps % config.save_every_steps == 0:
-            save_model(completed_steps, model, config.lora)
+            save_model(completed_steps, model, tokenizer, config.lora)
         if completed_steps % config.eval_every_steps == 0:
             model.eval()
             accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
@@ -288,29 +295,25 @@ def train(
                 }
             )
 
-    with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
-        for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
-            retry = False
-            try:
-                step_fn(batch)
-            except torch.cuda.OutOfMemoryError:
-                retry = True
-            if retry:
-                gc.collect()
-                torch.cuda.memory.empty_cache()
-                step_fn(batch)
-            if step > 0:
-                break
+    #with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
+    for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
+        gc.collect()
+        torch.cuda.memory.empty_cache()
+        step_fn(batch)
+        if step > 100:
+            break
+    """
     print("Exporting chrome trace.")
     prof.export_chrome_trace(f"traces/trace_{local_rank}.json")
     print(f"Exporting memory timeline after step.")
     prof.export_memory_timeline(
         f"timelines/memory_timeline_{local_rank}.html", f"cuda:{local_rank}"
     )
+    """
     exit(0)
     accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
     wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
-    save_model("final", model, config.lora)
+    save_model("final", model, tokenizer, config.lora)
 
 
 def main(config, local_rank, world_size):
@@ -322,7 +325,6 @@ def main(config, local_rank, world_size):
     seed = utils.enforce_reproducibility(config.seed)
     config.seed = seed
     # model, tokenizer = load_model(config)
-    print("Loaded model, beginning training.")
     train(None, None, config, local_rank, world_size)
 
 
@@ -366,4 +368,5 @@ if __name__ == "__main__":
         torch.backends.cudnn.allow_tf32 = True
         torch.cuda.set_device(local_rank)
         dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
+        print(torch.distributed.get_world_size())
         main(config, local_rank, world_size)
