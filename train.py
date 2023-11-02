@@ -90,7 +90,9 @@ def save_model(step, model, tokenizer, is_lora):
             cpu_state = model.state_dict()
         if local_rank == 0:
             assert wandb.run is not None
-            checkpoint_folder = os.path.join(OUTPUT_DIR, f"{wandb.run.name}/step-{step}")
+            checkpoint_folder = os.path.join(
+                OUTPUT_DIR, f"{wandb.run.name}/step-{step}"
+            )
             print("Saving model.")
             model.save_pretrained(checkpoint_folder, state_dict=cpu_state)
             tokenizer.save_pretrained(checkpoint_folder)
@@ -117,8 +119,8 @@ def load_model(config: Config):
         config.model_name_or_path,
         torch_dtype=torch.bfloat16,
     )
-    model.config.use_cache=False
-    model.language_model.config.use_cache=False
+    model.config.use_cache = False
+    model.language_model.config.use_cache = False
 
     model.language_model.model.gradient_checkpointing_enable()
     model.gradient_checkpointing_enable()
@@ -192,11 +194,9 @@ def train(
     )
     max_train_steps = len(train_dataloader)
 
-    from transformers.models.fuyu.modeling_fuyu import \
-        FuyuVisionEmbedTokens
+    from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
     from transformers.models.persimmon.modeling_persimmon import (
-        PersimmonDecoderLayer, PersimmonEmbedTokens,
-        PersimmonOutputEmbedding)
+        PersimmonDecoderLayer, PersimmonEmbedTokens, PersimmonOutputEmbedding)
 
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
@@ -222,7 +222,7 @@ def train(
     model = FSDP(
         model,
         limit_all_gathers=True,
-        cpu_offload=None,#CPUOffload(offload_params=True),
+        cpu_offload=None,  # CPUOffload(offload_params=True),
         backward_prefetch=None,
         param_init_fn=None,
         auto_wrap_policy=auto_wrap_policy,
@@ -263,6 +263,7 @@ def train(
         nonlocal model
         nonlocal losses
         nonlocal completed_steps
+        model.train()
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
         try:
             loss = model(**batch).loss
@@ -287,24 +288,24 @@ def train(
             losses = []
         if completed_steps % config.save_every_steps == 0:
             save_model(completed_steps, model, tokenizer, config.lora)
-        if completed_steps % config.eval_every_steps == 0:
+        if completed_steps % config.eval_every_steps == 0 or completed_steps == 1:
             model.eval()
-            accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
-            wandb.log(
-                {
-                    "step": completed_steps,
-                    "accuracy/val": accuracy,
-                    "loss/val": eval_loss,
-                }
+            accuracy = eval.auto_eval_dist(
+                model, auto_eval_dataloader, local_rank, world_size
             )
+            if local_rank == 0 and accuracy is not None:
+                wandb.log(
+                    {
+                        "step": completed_steps,
+                        "accuracy/val": accuracy,
+                    }
+                )
 
-    #with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
+    # with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
     for step, batch in enumerate(tqdm(train_dataloader, disable=(local_rank != 0))):
         gc.collect()
         torch.cuda.memory.empty_cache()
         step_fn(batch)
-        if step > 100:
-            break
     """
     print("Exporting chrome trace.")
     prof.export_chrome_trace(f"traces/trace_{local_rank}.json")
@@ -313,9 +314,13 @@ def train(
         f"timelines/memory_timeline_{local_rank}.html", f"cuda:{local_rank}"
     )
     """
-    exit(0)
-    accuracy, eval_loss = eval.do_auto_eval(model, auto_eval_dataloader)
-    wandb.log({"accuracy/final": accuracy, "loss/final": eval_loss})
+    accuracy = eval.auto_eval_dist(model, auto_eval_dataloader, local_rank, world_size)
+    if local_rank == 0:
+        wandb.log(
+            {
+                "accuracy/final": accuracy,
+            }
+        )
     save_model("final", model, tokenizer, config.lora)
 
 

@@ -25,7 +25,13 @@ class MultipleChoiceQuestion(object):
     question: str
     answers: List[str]
     correct_answer: int
-    question_id: str
+    question_id: int
+
+
+def get_question_id(question_id_string):
+    image_id, suffix = question_id_string.split(".")
+    question_id = int(image_id) * 100 + int(suffix.split("-")[-1])
+    return question_id
 
 
 def get_ai2d_questions(
@@ -48,7 +54,8 @@ def get_ai2d_questions(
             is_abc = question_data["abcLabel"]
             if is_abc and skip_abc:
                 continue
-            question_id = question_data["questionId"]
+            # hack to get an integral id
+            question_id = get_question_id(question_data["questionId"])
             if question_ids is not None and question_id not in question_ids:
                 continue
             questions.append(
@@ -116,13 +123,11 @@ class AI2DMultipleChoiceDataset(Dataset):
         image = Image.open(q.image_path).convert("RGB")
         input_text = get_input_text(q)
         model_inputs = self.processor(images=image, text=input_text)
-        if model_inputs is None:
-            raise ValueError(f"ModelInputs is none on {idx}")
         if self.include_labels:
             target = q.answers[q.correct_answer]
+            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
             model_inputs["is_correct"] = True
             model_inputs["question_id"] = q.question_id
-            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
         return model_inputs
 
     def split(self, test_ids: List[str]):
@@ -182,13 +187,11 @@ class AI2DDatasetForAutoEval(Dataset):
         image = Image.open(q.image_path).convert("RGB")
         input_text = get_input_text(q)
         model_inputs = self.processor(images=image, text=input_text)
-        if model_inputs is None:
-            raise ValueError(f"ModelInputs is none on {idx}")
         if self.include_labels:
             target = q.answers[answer_idx]
+            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
             model_inputs["is_correct"] = q.correct_answer == answer_idx
             model_inputs["question_id"] = q.question_id
-            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
         return model_inputs
 
 
@@ -219,9 +222,9 @@ class DataCollatorForMultimodal(object):
             collated["is_correct"] = torch.tensor(
                 [instance["is_correct"] for instance in instances]
             )
-            collated["question_id"] = [
-                instance["question_id"] for instance in instances
-            ]
+            collated["question_id"] = torch.tensor(
+                [instance["question_id"] for instance in instances]
+            ).long()
         return collated
 
 
@@ -274,27 +277,35 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
         AI2D_DATA_DIR, processor, test_question_ids, skip_abc=config.skip_abc
     )
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
-    sampler = DistributedSampler(
+    train_sampler = DistributedSampler(
         train_dataset,
         num_replicas=world_size,
         rank=local_rank,
         shuffle=True,
         seed=102,
     )
+    auto_eval_sampler = DistributedSampler(
+        dataset_for_auto_eval,
+        num_replicas=world_size,
+        rank=local_rank,
+        shuffle=False,
+        seed=102,
+    )
+
     train_dataloader = DataLoader(
         train_dataset,
         collate_fn=data_collator,
         batch_size=config.per_device_batch_size,
         pin_memory=True,
         num_workers=4,
-        sampler=sampler,
-        # worker_init_fn=utils.seed_worker,
+        sampler=train_sampler,
     )
     auto_eval_dataloader = DataLoader(
         dataset_for_auto_eval,
         batch_size=config.eval_batch_size,
         collate_fn=data_collator,
         pin_memory=True,
+        sampler=auto_eval_sampler,
         worker_init_fn=utils.seed_worker,
     )
     return train_dataloader, auto_eval_dataloader
