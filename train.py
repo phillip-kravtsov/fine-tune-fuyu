@@ -342,6 +342,7 @@ def train(
 
 class Trainer:
     def __init__(self, config, local_rank, world_size):
+        print("Initializing trainer.")
         self.config = config
         self.local_rank = local_rank
         self.world_size = world_size
@@ -520,6 +521,7 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.cuda.set_device(local_rank)
+        print("Initializing process group")
         dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
         trainer = Trainer(config, local_rank, world_size)
         trainer.train()
