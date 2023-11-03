@@ -8,6 +8,7 @@ from typing import List
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL import Image, ImageDraw, ImageFont
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
@@ -242,11 +243,13 @@ class DataCollatorForMultimodal(object):
         collated["input_ids"][~attention_mask] = self.pad_token_id
         collated["attention_mask"] = attention_mask
 
-        for key in ["is_correct", "question_id"]:
-            if key in instances[0]:
-                collated[key] = torch.tensor(
-                    [instance[key] for instance in instances], dtype=torch.long
-                )
+        if 'is_correct' in instances[0]:
+            collated['is_correct'] = torch.tensor(
+                [instance['is_correct'] for instance in instances]
+            )
+            collated['question_id'] = torch.tensor(
+                [instance['question_id'] for instance in instances], dtype=torch.long
+            )
         return collated
 
 
@@ -273,9 +276,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         )
 
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
-    dataset_for_auto_eval = AI2DDatasetForAutoEval(
-        test_questions, processor, include_labels=False
-    )
+    dataset_for_auto_eval = AI2DDatasetForAutoEval(test_questions, processor)
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
     if config.use_packed_sampler:
         lengths = np.array(
@@ -295,6 +296,9 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
             batch_sampler=batch_sampler,
             num_workers=4,
         )
+        max_train_steps = torch.tensor(len(train_dataloader)).long().to(local_rank)
+        dist.all_reduce(max_train_steps, op=dist.ReduceOp.MIN)
+        max_train_steps = max_train_steps.cpu().item()
     else:
         train_sampler = DistributedSampler(
             train_dataset,
@@ -311,6 +315,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
             num_workers=4,
             sampler=train_sampler,
         )
+        max_train_steps = len(train_dataloader)
 
     auto_eval_sampler = DistributedSampler(
         dataset_for_auto_eval,
@@ -328,7 +333,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         sampler=auto_eval_sampler,
         worker_init_fn=utils.seed_worker,
     )
-    return train_dataloader, auto_eval_dataloader
+    return train_dataloader, auto_eval_dataloader, max_train_steps
 
 
 def replace_text_and_save(base_path, question: MultipleChoiceQuestion):

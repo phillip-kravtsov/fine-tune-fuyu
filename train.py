@@ -103,7 +103,7 @@ def save_lora_model(step, model, tokenizer):
     tokenizer.save_pretrained(get_checkpoint_dir(step))
 
 
-def save_fsdp_model(step, model, tokenizer):
+def save_fsdp_model(step, model, tokenizer, local_rank):
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
         cpu_state = model.state_dict()
@@ -121,11 +121,11 @@ def save_fsdp_model(step, model, tokenizer):
         tokenizer.save_pretrained(get_checkpoint_dir(step))
 
 
-def save_model(step, model, tokenizer, is_lora):
+def save_model(step, model, tokenizer, is_lora, local_rank):
     return (
         save_lora_model(step, model, tokenizer)
         if is_lora
-        else save_fsdp_model(step, model, tokenizer)
+        else save_fsdp_model(step, model, tokenizer, local_rank)
     )
 
 
@@ -239,11 +239,9 @@ def train(
     )
     optimizer = get_optimizer(model, config)
 
-    train_dataloader, auto_eval_dataloader = data_module.get_data(
+    train_dataloader, auto_eval_dataloader, max_train_steps = data_module.get_data(
         config, world_size=world_size, local_rank=local_rank, tokenizer=tokenizer
     )
-    max_train_steps = torch.tensor(len(train_dataloader)).long().to(local_rank)
-    dist.all_reduce(max_train_steps, op=dist.ReduceOp.MIN)
 
     if local_rank == 0:
         print(model)
@@ -252,7 +250,7 @@ def train(
         name=config.scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=config.warmup_steps,
-        num_training_steps=max_train_steps.cpu().item(),
+        num_training_steps=max_train_steps,
     )
 
     if local_rank == 0:
@@ -293,7 +291,7 @@ def train(
                 wandb.log({"loss/train": loss}, step=completed_steps)
 
         if completed_steps % config.save_every_steps == 0:
-            save_model(completed_steps, model, tokenizer, config.lora)
+            save_model(completed_steps, model, tokenizer, config.lora, local_rank)
 
         if completed_steps % config.eval_every_steps == 0:
             accuracy, loss = eval.auto_eval_dist(
@@ -339,10 +337,161 @@ def train(
         )
         if local_rank == 0:
             wandb.log({"accuracy/final": accuracy, "loss/final": loss})
-        save_model("final", model, tokenizer, config.lora)
+        save_model("final", model, tokenizer, config.lora, local_rank)
 
 
-if __name__ == "__main__":
+class Trainer:
+    def __init__(self, config, local_rank, world_size):
+        self.config = config
+        self.local_rank = local_rank
+        self.world_size = world_size
+
+    def _init_tracking(self):
+        if self.local_rank == 0:
+            wandb.init(project="fuyu", config=self.config.__dict__)
+            if wandb.run is None:
+                raise Exception
+            save_config(self.config, wandb.run.name)
+
+    def throughput(self, batch):
+        end_time = time.time()
+        ct = torch.tensor(batch["input_ids"].shape[0]).to(self.local_rank)
+        dist.all_reduce(ct, op=dist.ReduceOp.SUM)
+        self.throughput_counter += ct.cpu().item()
+
+        if self.completed_steps % 10 == 0 and self.local_rank == 0:
+            throughput = self.throughput_counter / (
+                end_time - self.throughput_start_time
+            )
+            print(f"Throughput: {throughput} elts/sec")
+            wandb.log({"throughput": throughput}, step=self.completed_steps)
+            self.throughput_counter = 0
+            self.throughput_start_time = time.time()
+
+    def _profile_train_loop(self, train_dataloader):
+        with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
+            for batch in tqdm(train_dataloader, disable=(self.local_rank != 0)):
+                gc.collect()
+                torch.cuda.memory.empty_cache()
+                self.step(batch)
+                if self.completed_steps >= 10:
+                    self.throughput(batch)
+                    break
+        export_profile(prof, self.local_rank)
+
+    def step(self, batch):
+        model, optimizer, lr_scheduler = self.model, self.optimizer, self.lr_scheduler
+        model.train()
+        batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
+        try:
+            loss = model(**batch).loss
+            loss.backward()
+            model.clip_grad_norm_(1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            lr_scheduler.step()
+        except torch.cuda.OutOfMemoryError as e:
+            print("OOM on inputs with shape", batch["input_ids"].shape)
+            raise e
+        loss = loss.detach()
+        loss = utils.get_all_reduce_mean(loss).item()
+        self.completed_steps += 1
+        if self.local_rank == 0:
+            if wandb.run is not None:
+                wandb.log({"loss/train": loss}, step=self.completed_steps)
+
+    def save_model(self, step=None):
+        if step is None:
+            step = self.completed_steps
+        save_model(step, self.model, self.tokenizer, self.config.lora, self.local_rank)
+
+    def train(self):
+        config = self.config
+        self.model, self.tokenizer = self._init_model()
+        self.optimizer = get_optimizer(self.model, self.config)
+        train_dataloader, auto_eval_dataloader, max_train_steps = data_module.get_data(
+            config,
+            world_size=self.world_size,
+            local_rank=self.local_rank,
+            tokenizer=self.tokenizer,
+        )
+        self.lr_scheduler = get_scheduler(
+            name=config.scheduler_type,
+            optimizer=self.optimizer,
+            num_warmup_steps=config.warmup_steps,
+            num_training_steps=max_train_steps,
+        )
+        self._init_tracking()
+        self.completed_steps = 0
+        self.throughput_counter = 0
+        self.throughput_start_time = time.time()
+        dist.barrier()
+        if config.profile:
+            self._profile_train_loop(train_dataloader)
+        else:
+            for batch in tqdm(train_dataloader, disable=(self.local_rank != 0)):
+                self.step(batch)
+
+                self.throughput(batch)
+
+                if self.completed_steps % config.save_every_steps == 0:
+                    self.save_model()
+                if self.completed_steps % config.eval_every_steps == 0:
+                    accuracy, loss = eval.auto_eval_dist(
+                        self.model,
+                        auto_eval_dataloader,
+                        self.local_rank,
+                        self.world_size,
+                    )
+                    if self.local_rank == 0 and accuracy is not None:
+                        wandb.log(
+                            {"accuracy/val": accuracy, "loss/val": loss},
+                            step=self.completed_steps,
+                        )
+
+                if self.completed_steps >= max_train_steps:
+                    break
+
+            accuracy, loss = eval.auto_eval_dist(
+                self.model, auto_eval_dataloader, self.local_rank, self.world_size
+            )
+            if self.local_rank == 0:
+                wandb.log({"accuracy/final": accuracy, "loss/final": loss})
+            self.save_model('final')
+
+    def _init_model(self):
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={
+                FuyuVisionEmbedTokens,
+                PersimmonEmbedTokens,
+                PersimmonDecoderLayer,
+                PersimmonOutputEmbedding,
+            },
+        )
+        model, tokenizer = load_model(self.config)
+        model = FSDP(
+            model,
+            limit_all_gathers=True,
+            cpu_offload=None,
+            backward_prefetch=None,
+            param_init_fn=None,
+            auto_wrap_policy=auto_wrap_policy,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            device_id=torch.cuda.current_device(),
+            use_orig_params=True,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            ),
+        )
+        if self.local_rank == 0:
+            print(model)
+        return model, tokenizer
+
+
+def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     parser = argparse.ArgumentParser(description="Fine-tune Fuyu-8B")
     config = parse_args(parser)
@@ -372,4 +521,10 @@ if __name__ == "__main__":
         torch.backends.cudnn.allow_tf32 = True
         torch.cuda.set_device(local_rank)
         dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-        train(config, local_rank, world_size)
+        trainer = Trainer(config, local_rank, world_size)
+        trainer.train()
+        #train(config, local_rank, world_size)
+
+
+if __name__ == "__main__":
+    main()
