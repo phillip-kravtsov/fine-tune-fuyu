@@ -1,5 +1,4 @@
 from collections import defaultdict
-from typing import List
 
 import torch
 import torch.distributed as dist
@@ -127,7 +126,7 @@ def auto_eval_dist(model, dataloader, rank, world_size):
     flat_correct = torch.cat(is_correct_tensors).to(rank)
 
     our_length = torch.tensor(flat_ids.shape[0]).to(rank)
-    all_lens: List[torch.LongTensor] = [our_length for _ in range(world_size)]
+    all_lens = [our_length for _ in range(world_size)]
     dist.all_gather(all_lens, our_length)
 
     if rank == 0:

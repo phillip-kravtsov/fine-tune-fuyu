@@ -4,13 +4,13 @@ import math
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import List
 
+import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
-import numpy as np
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
 
@@ -31,39 +31,38 @@ class MultipleChoiceQuestion(object):
     question_id: int
 
 
-def get_question_id(question_id_string):
-    image_id, suffix = question_id_string.split(".")
-    question_id = int(image_id) * 100 + int(suffix.split("-")[-1])
-    return question_id
+def get_int_question_id(question_id: str) -> int:
+    image_id, suffix = question_id.split(".")
+    return int(image_id) * 100 + int(suffix.split("-")[-1])
 
 
-def get_ai2d_questions(
-    root_dir: str, question_ids: Optional[Set[str]], skip_abc=False
-) -> List[MultipleChoiceQuestion]:
-    questions = []
+def get_image_id(question: MultipleChoiceQuestion):
+    return question.image_path.split("/")[-1].split(".")[0]
+
+
+def get_ai2d_questions(root_dir: str, skip_abc=False) -> List[MultipleChoiceQuestion]:
     questions_dir = os.path.join(root_dir, "questions")
-    images_dir = os.path.join(root_dir, "images")
-    image_jsons = []
+    per_image_data = []
     for path in sorted(os.listdir(questions_dir)):
         with open(os.path.join(questions_dir, path), "r") as f:
-            image_jsons.append(json.load(f))
-    for data in image_jsons:
-        image_name = data["imageName"]
+            per_image_data.append(json.load(f))
+
+    questions = []
+    images_dir = os.path.join(root_dir, "images")
+    for image_data in per_image_data:
+        image_name = image_data["imageName"]
         image_path = os.path.join(images_dir, image_name)
         image_abc_path = os.path.join(
             images_dir, image_name.replace(".png", "-abc.png")
         )
-        for question_text, question_data in data["questions"].items():
+        for question_text, question_data in image_data["questions"].items():
             is_abc = question_data["abcLabel"]
-            if is_abc and skip_abc:
+            if skip_abc and is_abc:
                 continue
-            # hack to get an integral id
-            question_id = get_question_id(question_data["questionId"])
-            if question_ids is not None and question_id not in question_ids:
-                continue
+            question_id = get_int_question_id(question_data["questionId"])
             questions.append(
                 MultipleChoiceQuestion(
-                    image_path=image_path if not is_abc else image_abc_path,
+                    image_path=image_abc_path if is_abc else image_path,
                     question=question_text,
                     answers=question_data["answerTexts"],
                     correct_answer=question_data["correctAnswer"],
@@ -104,19 +103,13 @@ def add_labels_to_model_inputs(model_inputs, tokenizer, target):
 class AI2DMultipleChoiceDataset(Dataset):
     def __init__(
         self,
-        root_dir: str,
+        questions: List[MultipleChoiceQuestion],
         processor: FuyuProcessor,
-        skip_abc=False,
         include_labels=True,
     ):
-        self.questions: List[MultipleChoiceQuestion] = []
         self.processor = processor
         self.include_labels = include_labels
-        self.skip_abc = skip_abc
-        self._init_questions(root_dir)
-
-    def _init_questions(self, root_dir):
-        self.questions = get_ai2d_questions(root_dir, None, skip_abc=self.skip_abc)
+        self.questions = questions
 
     def __len__(self):
         return len(self.questions)
@@ -133,6 +126,7 @@ class AI2DMultipleChoiceDataset(Dataset):
             model_inputs["question_id"] = q.question_id
         return model_inputs
 
+    # these are not really AI2D specific
     def pad(self, image_height, image_width):
         ip = self.processor.image_processor
         padding_bottom = ip.target_height - image_height
@@ -196,27 +190,17 @@ class AI2DMultipleChoiceDataset(Dataset):
 class AI2DDatasetForAutoEval(Dataset):
     def __init__(
         self,
-        root_dir: str,
+        questions: List[MultipleChoiceQuestion],
         processor: FuyuProcessor,
-        question_ids: List[str],
         include_labels=True,
-        skip_abc=False,
     ):
-        self.question_ids = set(question_ids)
         self.include_labels = include_labels
-        self.questions: List[MultipleChoiceQuestion] = []
         self.processor = processor
-        self.skip_abc = skip_abc
-        self._init_questions(root_dir)
+        self.questions: List[MultipleChoiceQuestion] = questions
         self.length = sum([len(q.answers) for q in self.questions])
         self.answer_idx_to_question_idx = [
             (i, j) for i, q in enumerate(self.questions) for j in range(len(q.answers))
         ]
-
-    def _init_questions(self, root_dir):
-        self.questions = get_ai2d_questions(
-            root_dir, self.question_ids, skip_abc=self.skip_abc
-        )
 
     def __len__(self):
         return self.length
@@ -247,24 +231,22 @@ class DataCollatorForMultimodal(object):
             "image_patches_indices": -1,
             "labels": -100,
         }
-        for key in ["input_ids", "labels", "image_patches", "image_patches_indices"]:
+        for key in pad_values.keys():
             if key in instances[0]:
                 values = [instance[key].squeeze() for instance in instances]
                 collated[key] = pad_sequence(
                     values, batch_first=True, padding_value=pad_values[key]
                 )
         attention_mask = collated["input_ids"].ne(pad_values["input_ids"])
-        # Fuyu does not have a pad token id, so we don't want to overwrite
-        # the zero token.
+        # Avoid overwriting `0` token if it is there.
         collated["input_ids"][~attention_mask] = self.pad_token_id
         collated["attention_mask"] = attention_mask
-        if "is_correct" in instances[0]:
-            collated["is_correct"] = torch.tensor(
-                [instance["is_correct"] for instance in instances]
-            )
-            collated["question_id"] = torch.tensor(
-                [instance["question_id"] for instance in instances]
-            ).long()
+
+        for key in ["is_correct", "question_id"]:
+            if key in instances[0]:
+                collated[key] = torch.tensor(
+                    [instance[key] for instance in instances], dtype=torch.long
+                )
         return collated
 
 
@@ -280,12 +262,18 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
     test_ids = get_ai2d_test_ids()
     if config.max_eval_ids is not None:
         test_ids = test_ids[: config.max_eval_ids]
-    full_ds = AI2DMultipleChoiceDataset(
-        AI2D_DATA_DIR, processor, skip_abc=config.skip_abc
+    test_ids = set(test_ids)
+
+    all_questions = get_ai2d_questions(AI2D_DATA_DIR, skip_abc=config.skip_abc)
+    test_questions = [q for q in all_questions if get_image_id(q) in test_ids]
+    train_questions = [q for q in all_questions if get_image_id(q) not in test_ids]
+    print(
+        f"There are {len(train_questions)} training questions and {len(test_questions)} test questions."
     )
-    train_dataset, _, test_question_ids = full_ds.split(test_ids)
+
+    train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     dataset_for_auto_eval = AI2DDatasetForAutoEval(
-        AI2D_DATA_DIR, processor, test_question_ids, skip_abc=config.skip_abc
+        test_questions, processor, include_labels=False
     )
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
     use_multipack = True
