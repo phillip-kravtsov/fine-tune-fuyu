@@ -22,10 +22,11 @@ class Config:
     run_name: Optional[str] = field(default=None)
     weight_decay: float = field(default=0.01)
     do_vocab_surgery: bool = field(default=False)
-    seed: Optional[int] = field(default=None)
+    seed: int = field(default=42)
     skip_abc: bool = field(default=False)
     use_flash_attn: bool = field(default=False)
     profile: bool = field(default=False)
+    use_packed_sampler: bool = field(default=False)
 
 
 def parse_args(parser) -> Config:
@@ -43,9 +44,11 @@ def parse_args(parser) -> Config:
                 if is_optional
                 else field_type
             )
-
         arg_type = field_type if not is_optional else field_type.__args__[0]
         if arg_type == bool:
+            assert (
+                not default
+            ), "Default for bools must be False to simplify store_true."
             parser.add_argument(f"--{name}", action="store_true")
         else:
             parser.add_argument(f"--{name}", type=actual_type, default=default)

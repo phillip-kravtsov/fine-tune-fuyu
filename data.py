@@ -276,20 +276,16 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
         test_questions, processor, include_labels=False
     )
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
-    use_multipack = True
-    if use_multipack:
+    if config.use_packed_sampler:
         lengths = np.array(
-            [
-                train_dataset.dataset.estimate_input_size(train_dataset.indices[i])
-                for i in range(len(train_dataset))
-            ]
+            [train_dataset.estimate_input_size(i) for i in range(len(train_dataset))]
         )
         batch_sampler = PackedDistributedBatchSampler(
-            batch_max_length=3868,
+            batch_max_length=max(lengths) * config.per_device_batch_size,
             lengths=lengths,
             num_replicas=world_size,
             rank=local_rank,
-            seed=102,
+            seed=config.seed,
         )
         train_dataloader = DataLoader(
             train_dataset,
@@ -304,7 +300,7 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
             num_replicas=world_size,
             rank=local_rank,
             shuffle=True,
-            seed=102,
+            seed=config.seed,
         )
         train_dataloader = DataLoader(
             train_dataset,
@@ -320,7 +316,7 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
         num_replicas=world_size,
         rank=local_rank,
         shuffle=False,
-        seed=102,
+        seed=config.seed,
     )
 
     auto_eval_dataloader = DataLoader(

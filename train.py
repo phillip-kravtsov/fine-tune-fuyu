@@ -347,7 +347,7 @@ def main(config, local_rank, world_size):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Training Configuration")
+    parser = argparse.ArgumentParser(description="Fine-tune Fuyu-8B")
     config = parse_args(parser)
     if config.do_vocab_surgery:
         # Todo move to another file

@@ -40,7 +40,7 @@ def print_parameters(model):
             print(name)
 
 
-def profile_function(func):
+def python_profile_function(func):
     def wrapper(*args, **kwargs):
         profiler = cProfile.Profile()
         profiler.enable()
@@ -52,6 +52,7 @@ def profile_function(func):
     return wrapper
 
 
+# from Stas Bekman https://github.com/stas00/ml-engineering/tree/master/reproducibility
 def enforce_reproducibility(use_seed=None):
     seed = use_seed if use_seed is not None else random.randint(1, 1000000)
     print(f"Using seed: {seed}")
@@ -62,10 +63,6 @@ def enforce_reproducibility(use_seed=None):
     # pytorch RNGs
     torch.manual_seed(seed)  # cpu + cuda
     torch.cuda.manual_seed_all(seed)  # multi-gpu - can be called without gpus
-    if use_seed:  # slower speed! https://pytorch.org/docs/stable/notes/randomness.html#cuda-convolution-benchmarking
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
     return seed
 
 
@@ -131,24 +128,27 @@ def print_trainable_parameters(model):
 
 
 # use 1011 and 1019 for slim tokenizer.
-def get_image_from_inputs(inputs, idx=0, image_token=71011, image_nl_token=71019):
+def get_image_from_inputs(
+    inputs, idx=0, image_token=71011, image_nl_token=71019, patch_h=30, patch_w=30
+):
     ids = inputs["input_ids"][idx].detach().cpu()
     patches = inputs["image_patches"][idx].detach().cpu()
-    assert patches.shape[1] == 2700, "only 30 * 30 * 3 patches supported"
+    assert patches.shape[1] == patch_h * patch_w * 3
     w, h = 0, 0
+    # assumes variable size images (so includes raster order newlines)
     for token in ids[idx]:
         if token == image_token and h == 0:
             w += 1
         if token == image_nl_token:
             h += 1
     assert w * h == patches.shape[0]
-    imarr = np.zeros((30 * h, 30 * w, 3))
+    imarr = np.zeros((patch_h * h, patch_w * w, 3))
     for i in range(h):
         for j in range(w):
             patch_idx = w * i + j
-            imarr[i * 30 : (i + 1) * 30, j * 30 : (j + 1) * 30, :] = patches[
-                patch_idx
-            ].view(30, 30, 3)
+            imarr[
+                i * patch_h : (i + 1) * patch_h, j * patch_w : (j + 1) * patch_w, :
+            ] = patches[patch_idx].view(patch_h, patch_w, 3)
     scaled = (((imarr + 1) / 2) * 255).astype(np.uint8)
     return Image.fromarray(scaled)
 

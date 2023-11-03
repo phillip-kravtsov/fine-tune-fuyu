@@ -8,4 +8,5 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 \
   --max_eval_ids 200 \
   --seed 102 \
   --use_flash_attn \
+  --use_packed_sampler \
 #--model_name_or_path "../fuyu-2b" \
