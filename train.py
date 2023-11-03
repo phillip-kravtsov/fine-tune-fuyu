@@ -8,7 +8,7 @@ import pprint
 import shutil
 import time
 from dataclasses import asdict
-from typing import Union
+from typing import Union, Optional
 
 import torch
 import torch.distributed as dist
@@ -43,7 +43,7 @@ import wandb
 from config import Config, parse_args
 
 OUTPUT_DIR = "/workspace/fuyu/output"
-SAVE_SIGNAL_FILE = "should_save"
+SAVE_SIGNAL_FILE = "/root/should_save"
 
 
 def get_lora_model(model, checkpoint_dir: str, config: Config):
@@ -121,9 +121,8 @@ def save_fsdp_model(step, model, tokenizer, local_rank):
 
         model.save_pretrained(get_checkpoint_dir(step), state_dict=cpu_state)
         tokenizer.save_pretrained(get_checkpoint_dir(step))
-        save_signal_file = os.path.join(get_run_dir(), SAVE_SIGNAL_FILE)
-        if os.path.exists(save_signal_file):
-            os.remove(save_signal_file)
+        if os.path.exists(SAVE_SIGNAL_FILE):
+            os.remove(SAVE_SIGNAL_FILE)
 
 
 def save_model(step, model, tokenizer, is_lora, local_rank):
@@ -299,7 +298,7 @@ class Trainer:
         config: Config,
         local_rank: int,
         world_size: int,
-        max_train_steps=None,
+        max_train_steps: Optional[int]=None,
     ):
         print("Initializing trainer.")
         self.model = model
@@ -311,9 +310,9 @@ class Trainer:
         self.config = config
         self.local_rank = local_rank
         self.world_size = world_size
+        if max_train_steps is None:
+            max_train_steps = len(train_dataloader)
         self.max_train_steps = max_train_steps
-        if self.max_train_steps is None:
-            self.max_train_steps = len(train_dataloader)
 
     def _init_tracking(self):
         if self.local_rank == 0:
@@ -321,7 +320,6 @@ class Trainer:
             if wandb.run is None:
                 raise Exception
             save_config(self.config, wandb.run.name)
-        self.save_signal_file = os.path.join(get_run_dir(), SAVE_SIGNAL_FILE)
 
     def throughput(self, batch):
         end_time = time.time()
@@ -378,7 +376,7 @@ class Trainer:
     def train(self):
         config = self.config
         self._init_tracking()
-        self.completed_steps = 0
+        self.completed_steps: int = 0
         self.throughput_counter = 0
         self.throughput_start_time = time.time()
         dist.barrier()
@@ -392,7 +390,7 @@ class Trainer:
 
             self.throughput(batch)
 
-            if self.completed_steps % config.save_every_steps == 0 or os.path.exists(self.save_signal_file):
+            if self.completed_steps % config.save_every_steps == 0 or os.path.exists(SAVE_SIGNAL_FILE):
                 self.save_model()
 
             if self.completed_steps % config.eval_every_steps == 0:
@@ -412,7 +410,7 @@ class Trainer:
                 break
 
         accuracy, loss = eval.auto_eval_dist(
-            self.model, auto_eval_dataloader, self.local_rank, self.world_size
+            self.model, self.eval_dataloader, self.local_rank, self.world_size
         )
         if self.local_rank == 0:
             wandb.log({"accuracy/final": accuracy, "loss/final": loss})

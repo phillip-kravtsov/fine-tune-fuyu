@@ -5,8 +5,8 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 --rdzv-bac
   --max_eval_ids 200 \
   --per_device_batch_size 2 \
   --use_packed_sampler \
-  --learning_rate 2e-5 \
+  --learning_rate 3e-5 \
   --seed 102 \
   --use_flash_attn \
-  --weight_decay 0.01 \
+  --weight_decay 0.0 \
   --model_name_or_path "fuyu-8b-slim-vocab" \
