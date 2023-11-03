@@ -10,6 +10,7 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
+import numpy as np
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
 
@@ -275,9 +276,7 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
         image_processor=FuyuImageProcessor(),
         tokenizer=tokenizer,
     )
-    # This is only for training.
     processor.max_tokens_to_generate = 0
-
     test_ids = get_ai2d_test_ids()
     if config.max_eval_ids is not None:
         test_ids = test_ids[: config.max_eval_ids]
@@ -291,32 +290,25 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
     data_collator = DataCollatorForMultimodal(pad_token_id=0)
     use_multipack = True
     if use_multipack:
-        print("estimating lengths")
-        import numpy as np
-
         lengths = np.array(
             [
                 train_dataset.dataset.estimate_input_size(train_dataset.indices[i])
                 for i in range(len(train_dataset))
             ]
         )
-        print("Iterating over entire dataset to check lengths are correct..")
-        # for i in range(len(train_dataset)):
-        #    assert len(train_dataset[i]['input_ids']) == lengths[i], f"{len(train_dataset[i]['input_ids'])} != {lengths[i]}"
-        print("estimated lengths, constructing sampler")
         batch_sampler = PackedDistributedBatchSampler(
-            batch_max_length=3660,
+            batch_max_length=3868,
             lengths=lengths,
             num_replicas=world_size,
             rank=local_rank,
             seed=102,
         )
-        print("constructed sampler")
         train_dataloader = DataLoader(
             train_dataset,
             collate_fn=data_collator,
             pin_memory=True,
             batch_sampler=batch_sampler,
+            num_workers=4,
         )
     else:
         train_sampler = DistributedSampler(

@@ -202,7 +202,6 @@ def train(
 ):
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        # wrap very large embedding layers to reduce OOM.
         transformer_layer_cls={
             FuyuVisionEmbedTokens,
             PersimmonEmbedTokens,
@@ -266,7 +265,7 @@ def train(
         nonlocal throughput_counter
         model.train()
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
-        ct = torch.tensor(batch["input_ids"].shape[1]).to(local_rank)
+        ct = torch.tensor(batch["input_ids"].shape[0]).to(local_rank)
         dist.all_reduce(ct, op=dist.ReduceOp.SUM)
         throughput_counter += ct.cpu().item()
         try:
