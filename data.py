@@ -250,7 +250,7 @@ class DataCollatorForMultimodal(object):
         return collated
 
 
-def get_data(config: Config, world_size, local_rank, tokenizer):
+def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     # Cache vocab for performance
     vocab = tokenizer.get_vocab()
     tokenizer.get_vocab = lambda: vocab
@@ -267,9 +267,10 @@ def get_data(config: Config, world_size, local_rank, tokenizer):
     all_questions = get_ai2d_questions(AI2D_DATA_DIR, skip_abc=config.skip_abc)
     test_questions = [q for q in all_questions if get_image_id(q) in test_ids]
     train_questions = [q for q in all_questions if get_image_id(q) not in test_ids]
-    print(
-        f"There are {len(train_questions)} training questions and {len(test_questions)} test questions."
-    )
+    if local_rank == 0:
+        print(
+            f"There are {len(train_questions)} training questions and {len(test_questions)} test questions."
+        )
 
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     dataset_for_auto_eval = AI2DDatasetForAutoEval(

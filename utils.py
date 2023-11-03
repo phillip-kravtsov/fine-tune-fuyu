@@ -55,7 +55,6 @@ def python_profile_function(func):
 # from Stas Bekman https://github.com/stas00/ml-engineering/tree/master/reproducibility
 def enforce_reproducibility(use_seed=None):
     seed = use_seed if use_seed is not None else random.randint(1, 1000000)
-    print(f"Using seed: {seed}")
 
     random.seed(seed)  # python RNG
     np.random.seed(seed)  # numpy RNG

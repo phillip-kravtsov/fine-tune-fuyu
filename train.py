@@ -145,6 +145,7 @@ def load_model(config: Config):
         torch_dtype=torch.bfloat16,
     )
     assert model.language_model.config.use_flash_attn == config.use_flash_attn
+
     # Avoid conflicts with gradient checkpointing.
     model.language_model.config.use_cache = False
     model.config.use_cache = False
@@ -233,10 +234,7 @@ def train(
         config, world_size=world_size, local_rank=local_rank, tokenizer=tokenizer
     )
     max_train_steps = torch.tensor(len(train_dataloader)).long().to(local_rank)
-    # allreduce
-    print(max_train_steps)
     dist.all_reduce(max_train_steps, op=dist.ReduceOp.MIN)
-    print("postreduce", max_train_steps)
 
     if local_rank == 0:
         print(model)
@@ -321,8 +319,6 @@ def train(
         export_profile(prof, local_rank)
     else:
         for batch in tqdm(train_dataloader, disable=(local_rank != 0)):
-            gc.collect()
-            torch.cuda.memory.empty_cache()
             step_fn(batch)
             log_throughput()
             if completed_steps >= max_train_steps:
@@ -335,20 +331,18 @@ def train(
         save_model("final", model, tokenizer, config.lora)
 
 
-def main(config, local_rank, world_size):
+if __name__ == "__main__":
+    local_rank = int(os.environ["LOCAL_RANK"])
+    parser = argparse.ArgumentParser(description="Fine-tune Fuyu-8B")
+    config = parse_args(parser)
     if config.run_name is not None:
         print(f"Loading config from {config.run_name}")
         config = load_config(config.run_name)
+    utils.enforce_reproducibility(config.seed)
     if local_rank == 0:
         pprint.pprint(config)
-    seed = utils.enforce_reproducibility(config.seed)
-    config.seed = seed
-    train(config, local_rank, world_size)
+        print(f"Using seed {config.seed}")
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fine-tune Fuyu-8B")
-    config = parse_args(parser)
     if config.do_vocab_surgery:
         # Todo move to another file
         config.lora = False
@@ -359,7 +353,7 @@ if __name__ == "__main__":
         print("saving surgery model")
         tokenizer.save_pretrained("fuyu-8b-slim-vocab")
         model.save_pretrained("fuyu-8b-slim-vocab")
-        exit(0)
+
     else:
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -367,5 +361,4 @@ if __name__ == "__main__":
         torch.backends.cudnn.allow_tf32 = True
         torch.cuda.set_device(local_rank)
         dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-        print(torch.distributed.get_world_size())
-        main(config, local_rank, world_size)
+        train(config, local_rank, world_size)
