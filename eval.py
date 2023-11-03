@@ -21,7 +21,7 @@ def do_eval(model, step, max_steps, eval_dataloader):
             loss = model(**cleaned_batch).loss
         losses.append(loss.item())
     avg_loss = sum(losses) / len(losses)
-    wandb.log({"step": step, "loss/val": avg_loss})
+    wandb.log({"loss/val": avg_loss}, step=step)
     model.train()
 
 
@@ -148,16 +148,23 @@ def auto_eval_dist(model, dataloader, rank, world_size):
         all_ids = torch.cat(gather_ids_list)
         all_correct = torch.cat(gather_correct_list)
         by_question_id = defaultdict(list)
+        log_probs = []
         for prob, id, correct in zip(all_probs, all_ids, all_correct):
             by_question_id[id.item()].append((prob.item(), correct.item()))
+            if correct:
+                log_probs.append(prob.item())
+
         correct_by_question_id = {}
         for question_id, results in by_question_id.items():
             results.sort(key=lambda x: x[0])
             if len(results):
                 correct_by_question_id[question_id] = float(results[-1][1])
+
+        nll_loss = -sum(log_probs) / len(log_probs)
         acc = sum(correct_by_question_id.values()) / len(correct_by_question_id)
-        return acc
+        return acc, nll_loss
     else:
         dist.gather(flat_probs, None, dst=0)
         dist.gather(flat_ids, None, dst=0)
         dist.gather(flat_correct, None, dst=0)
+        return None, None

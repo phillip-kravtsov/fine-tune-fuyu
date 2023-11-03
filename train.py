@@ -281,17 +281,19 @@ def train(
         completed_steps += 1
         if local_rank == 0:
             if wandb.run is not None:
-                wandb.log({"step": completed_steps, "loss/train": loss})
+                wandb.log({"loss/train": loss}, step=completed_steps)
 
         if completed_steps % config.save_every_steps == 0:
             save_model(completed_steps, model, tokenizer, config.lora)
 
         if completed_steps % config.eval_every_steps == 0:
-            accuracy = eval.auto_eval_dist(
+            accuracy, loss = eval.auto_eval_dist(
                 model, auto_eval_dataloader, local_rank, world_size
             )
             if local_rank == 0 and accuracy is not None:
-                wandb.log({"step": completed_steps, "accuracy/val": accuracy})
+                wandb.log(
+                    {"accuracy/val": accuracy, "loss/val": loss}, step=completed_steps
+                )
 
     start_time = time.time()
 
@@ -303,7 +305,7 @@ def train(
             end_time = time.time()
             throughput = throughput_counter / (end_time - start_time)
             print(f"Throughput: {throughput} elts/sec")
-            wandb.log({"step": completed_steps, "throughput": throughput})
+            wandb.log({"throughput": throughput}, step=completed_steps)
             throughput_counter = 0
             start_time = time.time()
 
@@ -323,11 +325,11 @@ def train(
             log_throughput()
             if completed_steps >= max_train_steps:
                 break
-        accuracy = eval.auto_eval_dist(
+        accuracy, loss = eval.auto_eval_dist(
             model, auto_eval_dataloader, local_rank, world_size
         )
         if local_rank == 0:
-            wandb.log({"accuracy/final": accuracy})
+            wandb.log({"accuracy/final": accuracy, "loss/final": loss})
         save_model("final", model, tokenizer, config.lora)
 
 
