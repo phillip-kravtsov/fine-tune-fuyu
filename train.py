@@ -5,6 +5,7 @@ import glob
 import json
 import os
 import pprint
+import shutil
 import time
 from dataclasses import asdict
 from typing import Union
@@ -108,6 +109,14 @@ def save_fsdp_model(step, model, tokenizer):
         cpu_state = model.state_dict()
     if local_rank == 0:
         print("Saving model.")
+        run_dir = get_run_dir()
+        checkpoints = glob.glob(os.path.join(run_dir, "step-*"))
+        if len(checkpoints) >= 2:
+            steps = sorted([int(c.split("-")[-1]) for c in checkpoints])
+            for step_to_delete in steps[:-1]:
+                print(f"Deleting checkpoint {step_to_delete}")
+                shutil.rmtree(get_checkpoint_dir(step_to_delete))
+
         model.save_pretrained(get_checkpoint_dir(step), state_dict=cpu_state)
         tokenizer.save_pretrained(get_checkpoint_dir(step))
 
