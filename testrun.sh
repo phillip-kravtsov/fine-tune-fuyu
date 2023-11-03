@@ -8,6 +8,4 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 \
   --max_eval_ids 200 \
   --seed 102 \
   --use_flash_attn \
-  --model_name_or_path "../fuyu-tiny" \
-#--model_name_or_path "../fuyu-2b" \
-#  --model_name_or_path "fuyu-8b-slim-vocab" \
+  --model_name_or_path "fuyu-tiny-random" \ # you can produce this with scripts/create_small_model.py

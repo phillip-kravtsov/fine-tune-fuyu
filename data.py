@@ -243,12 +243,12 @@ class DataCollatorForMultimodal(object):
         collated["input_ids"][~attention_mask] = self.pad_token_id
         collated["attention_mask"] = attention_mask
 
-        if 'is_correct' in instances[0]:
-            collated['is_correct'] = torch.tensor(
-                [instance['is_correct'] for instance in instances]
+        if "is_correct" in instances[0]:
+            collated["is_correct"] = torch.tensor(
+                [instance["is_correct"] for instance in instances]
             )
-            collated['question_id'] = torch.tensor(
-                [instance['question_id'] for instance in instances], dtype=torch.long
+            collated["question_id"] = torch.tensor(
+                [instance["question_id"] for instance in instances], dtype=torch.long
             )
         return collated
 
