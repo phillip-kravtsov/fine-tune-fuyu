@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import os
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from transformers import FuyuImageProcessor, FuyuProcessor
 
 import utils
 from config import Config
+from sampler import PackedDistributedBatchSampler
 
 AI2D_DATA_DIR = "/workspace/ai2d"
 FONT_PATH = "/workspace/Arial.ttf"
@@ -81,7 +83,7 @@ def get_ai2d_test_ids():
     test_ids_csv_path = os.path.join(AI2D_DATA_DIR, "ai2d_test_ids.csv")
     with open(test_ids_csv_path, "r") as f:
         test_ids = [line.strip() for line in f.readlines()]
-    return test_ids
+    return sorted(test_ids)
 
 
 def add_labels_to_model_inputs(model_inputs, tokenizer, target):
@@ -129,6 +131,43 @@ class AI2DMultipleChoiceDataset(Dataset):
             model_inputs["is_correct"] = True
             model_inputs["question_id"] = q.question_id
         return model_inputs
+
+    def pad(self, image_height, image_width):
+        ip = self.processor.image_processor
+        padding_bottom = ip.target_height - image_height
+        padding_right = ip.target_width - image_width
+        return image_height + padding_bottom, image_width + padding_right
+
+    def scale(self, image_height, image_width):
+        ip = self.processor.image_processor
+        if image_width <= ip.target_width and image_height <= ip.target_height:
+            return image_height, image_width
+
+        height_scale_factor = ip.target_height / image_height
+        width_scale_factor = ip.target_width / image_width
+        optimal_scale_factor = min(height_scale_factor, width_scale_factor)
+
+        new_height = int(image_height * optimal_scale_factor)
+        new_width = int(image_width * optimal_scale_factor)
+        return new_height, new_width
+
+    def estimate_input_size(self, idx):
+        q = self.questions[idx]
+        w, h = Image.open(q.image_path).size
+        patch_h, patch_w = 30, 30
+        input = self.processor.tokenizer.encode(get_input_text(q))
+        target = self.processor.tokenizer.encode(
+            q.answers[q.correct_answer], add_special_tokens=False
+        )
+        padded_h, padded_w = self.pad(
+            *self.scale(h, w),
+        )
+        new_h = min(padded_h, math.ceil(h / patch_h) * patch_h)
+        new_w = min(padded_w, math.ceil(w / patch_w) * patch_w)
+        num_patches = self.processor.image_processor.get_num_patches(
+            new_h, new_w, patch_h, patch_w
+        )
+        return len(input) + len(target) + 2 + new_h // patch_h + num_patches
 
     def split(self, test_ids: List[str]):
         image_to_question_indices: OrderedDict[str, List[int]] = OrderedDict()
@@ -228,6 +267,93 @@ class DataCollatorForMultimodal(object):
         return collated
 
 
+def get_data(config: Config, world_size, local_rank, tokenizer):
+    # Cache vocab for performance
+    vocab = tokenizer.get_vocab()
+    tokenizer.get_vocab = lambda: vocab
+    processor = FuyuProcessor(
+        image_processor=FuyuImageProcessor(),
+        tokenizer=tokenizer,
+    )
+    # This is only for training.
+    processor.max_tokens_to_generate = 0
+
+    test_ids = get_ai2d_test_ids()
+    if config.max_eval_ids is not None:
+        test_ids = test_ids[: config.max_eval_ids]
+    full_ds = AI2DMultipleChoiceDataset(
+        AI2D_DATA_DIR, processor, skip_abc=config.skip_abc
+    )
+    train_dataset, _, test_question_ids = full_ds.split(test_ids)
+    dataset_for_auto_eval = AI2DDatasetForAutoEval(
+        AI2D_DATA_DIR, processor, test_question_ids, skip_abc=config.skip_abc
+    )
+    data_collator = DataCollatorForMultimodal(pad_token_id=0)
+    use_multipack = True
+    if use_multipack:
+        print("estimating lengths")
+        import numpy as np
+
+        lengths = np.array(
+            [
+                train_dataset.dataset.estimate_input_size(train_dataset.indices[i])
+                for i in range(len(train_dataset))
+            ]
+        )
+        print("Iterating over entire dataset to check lengths are correct..")
+        # for i in range(len(train_dataset)):
+        #    assert len(train_dataset[i]['input_ids']) == lengths[i], f"{len(train_dataset[i]['input_ids'])} != {lengths[i]}"
+        print("estimated lengths, constructing sampler")
+        batch_sampler = PackedDistributedBatchSampler(
+            batch_max_length=3660,
+            lengths=lengths,
+            num_replicas=world_size,
+            rank=local_rank,
+            seed=102,
+        )
+        print("constructed sampler")
+        train_dataloader = DataLoader(
+            train_dataset,
+            collate_fn=data_collator,
+            pin_memory=True,
+            batch_sampler=batch_sampler,
+        )
+    else:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=local_rank,
+            shuffle=True,
+            seed=102,
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
+            collate_fn=data_collator,
+            batch_size=config.per_device_batch_size,
+            pin_memory=True,
+            num_workers=4,
+            sampler=train_sampler,
+        )
+
+    auto_eval_sampler = DistributedSampler(
+        dataset_for_auto_eval,
+        num_replicas=world_size,
+        rank=local_rank,
+        shuffle=False,
+        seed=102,
+    )
+
+    auto_eval_dataloader = DataLoader(
+        dataset_for_auto_eval,
+        batch_size=config.eval_batch_size,
+        collate_fn=data_collator,
+        pin_memory=True,
+        sampler=auto_eval_sampler,
+        worker_init_fn=utils.seed_worker,
+    )
+    return train_dataloader, auto_eval_dataloader
+
+
 def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
     j = int(question.image_path.replace("-abc", "").split(".")[0].split("/")[-1])
     impath = os.path.join(base_path, "images", f"{j}.png")
@@ -253,62 +379,6 @@ def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
         replacement_text = value["replacementText"]
         draw.text(top_left, replacement_text, font=font, fill=(0, 0, 0))
     img.save(impath_abc)
-
-
-def get_data(config: Config, world_size, local_rank, tokenizer):
-    # Cache vocab for performance
-    vocab = tokenizer.get_vocab()
-    tokenizer.get_vocab = lambda: vocab
-    processor = FuyuProcessor(
-        image_processor=FuyuImageProcessor(),
-        tokenizer=tokenizer,
-    )
-    # This is only for training.
-    processor.max_tokens_to_generate = 0
-
-    test_ids = get_ai2d_test_ids()
-    if config.max_eval_ids is not None:
-        test_ids = test_ids[: config.max_eval_ids]
-    full_ds = AI2DMultipleChoiceDataset(
-        AI2D_DATA_DIR, processor, skip_abc=config.skip_abc
-    )
-    train_dataset, _, test_question_ids = full_ds.split(test_ids)
-    dataset_for_auto_eval = AI2DDatasetForAutoEval(
-        AI2D_DATA_DIR, processor, test_question_ids, skip_abc=config.skip_abc
-    )
-    data_collator = DataCollatorForMultimodal(pad_token_id=0)
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=local_rank,
-        shuffle=True,
-        seed=102,
-    )
-    auto_eval_sampler = DistributedSampler(
-        dataset_for_auto_eval,
-        num_replicas=world_size,
-        rank=local_rank,
-        shuffle=False,
-        seed=102,
-    )
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        collate_fn=data_collator,
-        batch_size=config.per_device_batch_size,
-        pin_memory=True,
-        num_workers=4,
-        sampler=train_sampler,
-    )
-    auto_eval_dataloader = DataLoader(
-        dataset_for_auto_eval,
-        batch_size=config.eval_batch_size,
-        collate_fn=data_collator,
-        pin_memory=True,
-        sampler=auto_eval_sampler,
-        worker_init_fn=utils.seed_worker,
-    )
-    return train_dataloader, auto_eval_dataloader
 
 
 def create_overlay_images():

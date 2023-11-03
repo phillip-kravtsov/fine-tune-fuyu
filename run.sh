@@ -1,9 +1,11 @@
 torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 \
 	train.py \
-  --eval_every_steps 500 \
-  --save_every_steps 500 \
+  --eval_every_steps 200 \
+  --save_every_steps 200 \
   --model_name_or_path "fuyu-8b-slim-vocab" \
   --per_device_batch_size 2 \
-  --learning_rate 1e-4 \
+  --learning_rate 1e-5 \
   --max_eval_ids 200 \
-  #--model_name_or_path "../fuyu-2b" \
+  --seed 102 \
+  --use_flash_attn \
+#--model_name_or_path "../fuyu-2b" \

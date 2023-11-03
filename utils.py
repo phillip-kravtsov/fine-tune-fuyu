@@ -5,6 +5,7 @@ import random
 
 import numpy as np
 import torch
+from PIL import Image
 from tokenizers import Tokenizer
 from transformers.models.fuyu import FuyuConfig, FuyuForCausalLM
 
@@ -127,6 +128,29 @@ def print_trainable_parameters(model):
         f"all params: {all_param} || "
         f"trainable: {100 * trainable_params / all_param}"
     )
+
+
+# use 1011 and 1019 for slim tokenizer.
+def get_image_from_inputs(inputs, idx=0, image_token=71011, image_nl_token=71019):
+    ids = inputs["input_ids"][idx].detach().cpu()
+    patches = inputs["image_patches"][idx].detach().cpu()
+    assert patches.shape[1] == 2700, "only 30 * 30 * 3 patches supported"
+    w, h = 0, 0
+    for token in ids[idx]:
+        if token == image_token and h == 0:
+            w += 1
+        if token == image_nl_token:
+            h += 1
+    assert w * h == patches.shape[0]
+    imarr = np.zeros((30 * h, 30 * w, 3))
+    for i in range(h):
+        for j in range(w):
+            patch_idx = w * i + j
+            imarr[i * 30 : (i + 1) * 30, j * 30 : (j + 1) * 30, :] = patches[
+                patch_idx
+            ].view(30, 30, 3)
+    scaled = (((imarr + 1) / 2) * 255).astype(np.uint8)
+    return Image.fromarray(scaled)
 
 
 def get_all_reduce_mean(tensor):

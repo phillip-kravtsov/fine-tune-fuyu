@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass, field, fields
+from typing import Optional, Union, get_args, get_origin
 
 
 @dataclass
@@ -26,3 +26,29 @@ class Config:
     skip_abc: bool = field(default=False)
     use_flash_attn: bool = field(default=False)
     profile: bool = field(default=False)
+
+
+def parse_args(parser) -> Config:
+    for field in fields(Config):
+        name = field.name
+        default = field.default
+        field_type = field.type
+        actual_type = field_type
+        is_optional = False
+        if get_origin(field_type) is Union:
+            arg_types = get_args(field_type)
+            is_optional = any(t == type(None) for t in arg_types)
+            actual_type = (
+                [t for t in arg_types if t != type(None)][0]
+                if is_optional
+                else field_type
+            )
+
+        arg_type = field_type if not is_optional else field_type.__args__[0]
+        if arg_type == bool:
+            parser.add_argument(f"--{name}", action="store_true")
+        else:
+            parser.add_argument(f"--{name}", type=actual_type, default=default)
+    args = parser.parse_args()
+    config = Config(**vars(args))
+    return config

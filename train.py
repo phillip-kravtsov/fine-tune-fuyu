@@ -6,8 +6,8 @@ import json
 import os
 import pprint
 import time
-from dataclasses import asdict, field, fields
-from typing import Union, get_args, get_origin
+from dataclasses import asdict
+from typing import Union
 
 import torch
 import torch.distributed as dist
@@ -27,12 +27,18 @@ from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.profiler import profile
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
+from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
+from transformers.models.persimmon.modeling_persimmon import (
+    PersimmonDecoderLayer,
+    PersimmonEmbedTokens,
+    PersimmonOutputEmbedding,
+)
 
 import data as data_module
 import eval
 import utils
 import wandb
-from config import Config
+from config import Config, parse_args
 
 OUTPUT_DIR = "/workspace/fuyu/output"
 
@@ -87,7 +93,7 @@ def get_run_dir(run_name=None):
     if run_name is None:
         assert wandb.run is not None
         run_name = wandb.run.name
-    return os.path.join(OUTPUT_DIR, f"{wandb.run.name}")
+    return os.path.join(OUTPUT_DIR, run_name)
 
 
 def save_lora_model(step, model, tokenizer):
@@ -131,12 +137,14 @@ def load_model(config: Config):
     if config.run_name is not None:
         model_path = get_latest_checkpoint_dir(config.run_name)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
-    fuyu_config = transformers.FuyuConfig(use_flash_attn=config.use_flash_attn)
+    fuyu_config = transformers.FuyuConfig.from_pretrained(model_path)
+    fuyu_config.update(dict(use_flash_attn=config.use_flash_attn))
     model: transformers.FuyuForCausalLM = transformers.FuyuForCausalLM.from_pretrained(
         model_path,
         config=fuyu_config,
         torch_dtype=torch.bfloat16,
     )
+    assert model.language_model.config.use_flash_attn == config.use_flash_attn
     # Avoid conflicts with gradient checkpointing.
     model.language_model.config.use_cache = False
     model.config.use_cache = False
@@ -161,7 +169,7 @@ def load_config(run_name: str) -> Config:
 
 
 def save_config(config: Config, run_name: str):
-    run_dir = f"/{OUTPUT_DIR}/{run_name}"
+    run_dir = get_run_dir(run_name)
     if not os.path.exists(run_dir):
         os.makedirs(run_dir)
         with open(os.path.join(run_dir, "config.json"), "w") as f:
@@ -192,21 +200,9 @@ def train(
     local_rank,
     world_size,
 ):
-    tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name_or_path)
-    train_dataloader, auto_eval_dataloader = data_module.get_data(
-        config, world_size=world_size, local_rank=local_rank, tokenizer=tokenizer
-    )
-    max_train_steps = len(train_dataloader)
-
-    from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
-    from transformers.models.persimmon.modeling_persimmon import (
-        PersimmonDecoderLayer,
-        PersimmonEmbedTokens,
-        PersimmonOutputEmbedding,
-    )
-
     auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
+        # wrap very large embedding layers to reduce OOM.
         transformer_layer_cls={
             FuyuVisionEmbedTokens,
             PersimmonEmbedTokens,
@@ -233,6 +229,16 @@ def train(
         ),
     )
     optimizer = get_optimizer(model, config)
+
+    train_dataloader, auto_eval_dataloader = data_module.get_data(
+        config, world_size=world_size, local_rank=local_rank, tokenizer=tokenizer
+    )
+    max_train_steps = torch.tensor(len(train_dataloader)).long().to(local_rank)
+    # allreduce
+    print(max_train_steps)
+    dist.all_reduce(max_train_steps, op=dist.ReduceOp.MIN)
+    print("postreduce", max_train_steps)
+
     if local_rank == 0:
         print(model)
 
@@ -240,7 +246,7 @@ def train(
         name=config.scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=config.warmup_steps,
-        num_training_steps=max_train_steps,
+        num_training_steps=max_train_steps.cpu().item(),
     )
 
     if local_rank == 0:
@@ -252,12 +258,17 @@ def train(
     completed_steps = 0
     model.train()
     dist.barrier()
+    throughput_counter = 0
 
     def step_fn(batch):
         nonlocal model
         nonlocal completed_steps
+        nonlocal throughput_counter
         model.train()
         batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
+        ct = torch.tensor(batch["input_ids"].shape[1]).to(local_rank)
+        dist.all_reduce(ct, op=dist.ReduceOp.SUM)
+        throughput_counter += ct.cpu().item()
         try:
             loss = model(**batch).loss
             loss.backward()
@@ -278,7 +289,7 @@ def train(
         if completed_steps % config.save_every_steps == 0:
             save_model(completed_steps, model, tokenizer, config.lora)
 
-        if completed_steps % config.eval_every_steps == 0 or completed_steps == 1:
+        if completed_steps % config.eval_every_steps == 0:
             accuracy = eval.auto_eval_dist(
                 model, auto_eval_dataloader, local_rank, world_size
             )
@@ -290,11 +301,13 @@ def train(
     def log_throughput():
         nonlocal start_time
         nonlocal completed_steps
+        nonlocal throughput_counter
         if completed_steps % 10 == 0 and local_rank == 0:
             end_time = time.time()
-            throughput = 10 / (end_time - start_time)
-            print(f"Throughput: {throughput} steps/sec")
+            throughput = throughput_counter / (end_time - start_time)
+            print(f"Throughput: {throughput} elts/sec")
             wandb.log({"step": completed_steps, "throughput": throughput})
+            throughput_counter = 0
             start_time = time.time()
 
     if config.profile:
@@ -313,6 +326,8 @@ def train(
             torch.cuda.memory.empty_cache()
             step_fn(batch)
             log_throughput()
+            if completed_steps >= max_train_steps:
+                break
         accuracy = eval.auto_eval_dist(
             model, auto_eval_dataloader, local_rank, world_size
         )
@@ -334,29 +349,7 @@ def main(config, local_rank, world_size):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training Configuration")
-    for field in fields(Config):
-        name = field.name
-        default = field.default
-        field_type = field.type
-        is_optional = False
-        if get_origin(field_type) is Union:
-            arg_types = get_args(field_type)
-            is_optional = any(t == type(None) for t in arg_types)
-            actual_type = (
-                [t for t in arg_types if t != type(None)][0]
-                if is_optional
-                else field_type
-            )
-
-        arg_type = field_type if not is_optional else field_type.__args__[0]
-        if arg_type == bool:
-            parser.add_argument(f"--{name}", action="store_true")
-        else:
-            parser.add_argument(f"--{name}", type=arg_type, default=default)
-
-    args = parser.parse_args()
-    config = Config(**vars(args))
-
+    config = parse_args(parser)
     if config.do_vocab_surgery:
         # Todo move to another file
         config.lora = False

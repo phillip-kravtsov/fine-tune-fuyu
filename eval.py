@@ -1,4 +1,5 @@
 from collections import defaultdict
+from typing import List
 
 import torch
 import torch.distributed as dist
@@ -58,8 +59,6 @@ def get_label_log_probs(logits: torch.Tensor, labels: torch.Tensor):
     ).squeeze(-1)
     selected_log_probs = torch.where(non_ignore_indices, selected_log_probs, 0.0)
     return torch.sum(selected_log_probs, dim=1)
-    # probs = torch.exp(sequence_log_prob)
-    # return probs
 
 
 def do_auto_eval(model, dataloader: DataLoader):
@@ -115,7 +114,7 @@ def auto_eval_dist(model, dataloader, rank, world_size):
                 try:
                     outputs = model(**utils.prepare_inputs(subbatch, model.device))
                 except torch.cuda.OutOfMemoryError as e:
-                    print(subbatch["input_ids"].shape)
+                    print("Cuda OOM on input with shape", subbatch["input_ids"].shape)
                     raise e
                 probs = get_label_log_probs(outputs.logits.float(), subbatch["labels"])
             is_correct = subbatch["is_correct"]
@@ -128,7 +127,7 @@ def auto_eval_dist(model, dataloader, rank, world_size):
     flat_correct = torch.cat(is_correct_tensors).to(rank)
 
     our_length = torch.tensor(flat_ids.shape[0]).to(rank)
-    all_lens = [our_length for _ in range(world_size)]
+    all_lens: List[torch.LongTensor] = [our_length for _ in range(world_size)]
     dist.all_gather(all_lens, our_length)
 
     if rank == 0:
