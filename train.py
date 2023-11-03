@@ -43,6 +43,7 @@ import wandb
 from config import Config, parse_args
 
 OUTPUT_DIR = "/workspace/fuyu/output"
+SAVE_SIGNAL_FILE = "should_save"
 
 
 def get_lora_model(model, checkpoint_dir: str, config: Config):
@@ -120,6 +121,9 @@ def save_fsdp_model(step, model, tokenizer, local_rank):
 
         model.save_pretrained(get_checkpoint_dir(step), state_dict=cpu_state)
         tokenizer.save_pretrained(get_checkpoint_dir(step))
+        save_signal_file = os.path.join(get_run_dir(), SAVE_SIGNAL_FILE)
+        if os.path.exists(save_signal_file):
+            os.remove(save_signal_file)
 
 
 def save_model(step, model, tokenizer, is_lora, local_rank):
@@ -317,6 +321,7 @@ class Trainer:
             if wandb.run is None:
                 raise Exception
             save_config(self.config, wandb.run.name)
+        self.save_signal_file = os.path.join(get_run_dir(), SAVE_SIGNAL_FILE)
 
     def throughput(self, batch):
         end_time = time.time()
@@ -387,8 +392,9 @@ class Trainer:
 
             self.throughput(batch)
 
-            if self.completed_steps % config.save_every_steps == 0:
+            if self.completed_steps % config.save_every_steps == 0 or os.path.exists(self.save_signal_file):
                 self.save_model()
+
             if self.completed_steps % config.eval_every_steps == 0:
                 accuracy, loss = eval.auto_eval_dist(
                     self.model,

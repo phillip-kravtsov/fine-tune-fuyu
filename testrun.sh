@@ -1,4 +1,4 @@
-torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 \
+torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=localhost:25499 \
 	train.py \
   --eval_every_steps 10 \
   --save_every_steps 10 \
@@ -7,5 +7,5 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 \
   --learning_rate 1e-5 \
   --max_eval_ids 200 \
   --seed 102 \
-  --use_flash_attn \
-  --model_name_or_path "fuyu-tiny-random" \ # you can produce this with scripts/create_small_model.py
+  --model_name_or_path "fuyu-tiny-random"
+# --use_flash_attn \

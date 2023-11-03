@@ -1,4 +1,4 @@
-torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 \
+torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=localhost:25500 \
 	train.py \
   --eval_every_steps 100 \
   --save_every_steps 400 \
