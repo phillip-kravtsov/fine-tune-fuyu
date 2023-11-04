@@ -8,12 +8,11 @@ import pprint
 import shutil
 import time
 from dataclasses import asdict
-from typing import Union, Optional
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 import transformers
-from torch.utils.data import DataLoader
 from peft import PeftModel, get_peft_model
 from peft.tuners.lora import LoraConfig, LoraLayer
 from torch.distributed.fsdp.api import (
@@ -27,6 +26,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.profiler import profile
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
 from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
@@ -298,7 +298,7 @@ class Trainer:
         config: Config,
         local_rank: int,
         world_size: int,
-        max_train_steps: Optional[int]=None,
+        max_train_steps: Optional[int] = None,
     ):
         print("Initializing trainer.")
         self.model = model
@@ -390,7 +390,9 @@ class Trainer:
 
             self.throughput(batch)
 
-            if self.completed_steps % config.save_every_steps == 0 or os.path.exists(SAVE_SIGNAL_FILE):
+            if self.completed_steps % config.save_every_steps == 0 or os.path.exists(
+                SAVE_SIGNAL_FILE
+            ):
                 self.save_model()
 
             if self.completed_steps % config.eval_every_steps == 0:

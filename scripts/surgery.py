@@ -45,7 +45,9 @@ def vocab_surgery(fuyu_model, tokenizer):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Remove unused tokens from a fuyu model. usage e.g.: python3 scripts/surgery.py --save_path fuyu-8b-slim-vocab")
+    parser = argparse.ArgumentParser(
+        description="Remove unused tokens from a fuyu model. usage e.g.: python3 scripts/surgery.py --save_path fuyu-8b-slim-vocab"
+    )
     parser.add_argument("save_path", type=str)
     parser.add_argument("model_name_or_path", type=str, default="adept/fuyu-8b")
     args = parser.parse_args()
