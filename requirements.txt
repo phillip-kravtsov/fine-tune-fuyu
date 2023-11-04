@@ -4,3 +4,5 @@ bitsandbytes
 accelerate
 torch==2.0.1
 peft
+transformers @ git+https://github.com/phillip-kravtsov/transformers@f3d541195a41ddf7e1182061a316658e603e0f39
+
