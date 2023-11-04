@@ -36,7 +36,7 @@ from transformers.models.persimmon.modeling_persimmon import (
     PersimmonOutputEmbedding,
 )
 
-import data as data_module
+import ai2d
 import eval
 import utils
 import wandb
@@ -441,7 +441,7 @@ def main():
     model, tokenizer = init_model(config)
     if local_rank == 0:
         print(model)
-    train_dataloader, eval_dataloader, max_train_steps = data_module.get_data(
+    train_dataloader, eval_dataloader, max_train_steps = ai2d.get_data(
         config,
         world_size=world_size,
         local_rank=local_rank,
