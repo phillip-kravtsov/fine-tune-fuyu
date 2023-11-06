@@ -33,7 +33,7 @@ from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
 from transformers.models.persimmon.modeling_persimmon import (
     PersimmonDecoderLayer,
     PersimmonEmbedTokens,
-    PersimmonOutputEmbedding,
+    PersimmonLMHead,
 )
 
 import ai2d
@@ -150,14 +150,11 @@ def load_model(config: Config):
     if config.run_name is not None:
         model_path = get_latest_checkpoint_dir(config.run_name)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
-    fuyu_config = transformers.FuyuConfig.from_pretrained(model_path)
-    fuyu_config.update(dict(use_flash_attn=config.use_flash_attn))
-    model: transformers.FuyuForCausalLM = transformers.FuyuForCausalLM.from_pretrained(
-        model_path,
-        config=fuyu_config,
+    model = transformers.FuyuForCausalLM.from_pretrained(
+        config.model_name_or_path,
         torch_dtype=torch.bfloat16,
+        use_flash_attention_2=config.use_flash_attn,
     )
-    assert model.language_model.config.use_flash_attn == config.use_flash_attn
 
     # Avoid conflicts with gradient checkpointing.
     model.language_model.config.use_cache = False
@@ -172,7 +169,7 @@ def load_model(config: Config):
     if config.lora:
         model = get_lora_model(model, model_path, config)
     elif config.run_name is not None:
-        raise NotImplementedError("Resuming non-finetune runs not yet implemented.")
+        raise NotImplementedError("Resuming full runs not yet implemented.")
     return model, tokenizer
 
 
@@ -185,7 +182,7 @@ def init_model(config):
                 FuyuVisionEmbedTokens,
                 PersimmonEmbedTokens,
                 PersimmonDecoderLayer,
-                PersimmonOutputEmbedding,
+                PersimmonLMHead,
             },
         )
         model = FSDP(
@@ -197,7 +194,7 @@ def init_model(config):
             auto_wrap_policy=auto_wrap_policy,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
             device_id=torch.cuda.current_device(),
-            use_orig_params=True,
+            # use_orig_params=True,
             mixed_precision=MixedPrecision(
                 param_dtype=torch.bfloat16,
                 reduce_dtype=torch.bfloat16,
@@ -350,7 +347,9 @@ class Trainer:
     def step(self, batch):
         model, optimizer, lr_scheduler = self.model, self.optimizer, self.lr_scheduler
         model.train()
-        batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
+        batch = utils.prepare_inputs(
+            batch, torch.cuda.current_device(), fdtype=torch.bfloat16
+        )
         try:
             loss = model(**batch).loss
             loss.backward()
@@ -439,8 +438,7 @@ def main():
     print("Initializing process group")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     model, tokenizer = init_model(config)
-    if local_rank == 0:
-        print(model)
+    print(model)
     train_dataloader, eval_dataloader, max_train_steps = ai2d.get_data(
         config,
         world_size=world_size,

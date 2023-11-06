@@ -1,8 +1,5 @@
 wandb
 scipy
-bitsandbytes
-accelerate
-torch==2.0.1
 peft
-transformers @ git+https://github.com/phillip-kravtsov/transformers@f3d541195a41ddf7e1182061a316658e603e0f39
+transformers @ git+https://github.com/phillip-kravtsov/transformers@c0d1a7b5a2f2955757d132d1a1d329f5550f2ddb
 

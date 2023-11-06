@@ -7,5 +7,5 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 --rdzv-bac
   --learning_rate 1e-5 \
   --max_eval_ids 200 \
   --seed 102 \
-  --model_name_or_path "fuyu-tiny-random"
-# --use_flash_attn \
+  --model_name_or_path "fuyu-tiny-random" \
+ --use_flash_attn \

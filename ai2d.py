@@ -2,7 +2,6 @@ import copy
 import json
 import math
 import os
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List
 
@@ -10,10 +9,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image, ImageDraw, ImageFont
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, Subset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
+from transformers.models.fuyu.processing_fuyu import BEGINNING_OF_ANSWER_STRING
 
 import utils
 from config import Config
@@ -115,32 +114,31 @@ class AI2DMultipleChoiceDataset(Dataset):
     def __len__(self):
         return len(self.questions)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
         q = self.questions[idx]
         image = Image.open(q.image_path).convert("RGB")
-        input_text = get_input_text(q)
-        model_inputs = self.processor(images=image, text=input_text)
-        if self.include_labels:
-            target = q.answers[q.correct_answer]
-            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
-            model_inputs["is_correct"] = True
-            model_inputs["question_id"] = q.question_id
-        return model_inputs
+        return {
+            "image": image,
+            "text": get_input_text(q),
+            "target": q.answers[q.correct_answer],
+            "is_correct": True,
+            "question_id": q.question_id,
+        }
 
     # these are not really AI2D specific
     def pad(self, image_height, image_width):
         ip = self.processor.image_processor
-        padding_bottom = ip.target_height - image_height
-        padding_right = ip.target_width - image_width
+        padding_bottom = ip.size["height"] - image_height
+        padding_right = ip.size["width"] - image_width
         return image_height + padding_bottom, image_width + padding_right
 
     def scale(self, image_height, image_width):
         ip = self.processor.image_processor
-        if image_width <= ip.target_width and image_height <= ip.target_height:
+        if image_width <= ip.size["width"] and image_height <= ip.size["height"]:
             return image_height, image_width
 
-        height_scale_factor = ip.target_height / image_height
-        width_scale_factor = ip.target_width / image_width
+        height_scale_factor = ip.size["height"] / image_height
+        width_scale_factor = ip.size["width"] / image_width
         optimal_scale_factor = min(height_scale_factor, width_scale_factor)
 
         new_height = int(image_height * optimal_scale_factor)
@@ -161,31 +159,9 @@ class AI2DMultipleChoiceDataset(Dataset):
         new_h = min(padded_h, math.ceil(h / patch_h) * patch_h)
         new_w = min(padded_w, math.ceil(w / patch_w) * patch_w)
         num_patches = self.processor.image_processor.get_num_patches(
-            new_h, new_w, patch_h, patch_w
+            new_h, new_w, {"height": patch_h, "width": patch_w}
         )
         return len(input) + len(target) + 2 + new_h // patch_h + num_patches
-
-    def split(self, test_ids: List[str]):
-        image_to_question_indices: OrderedDict[str, List[int]] = OrderedDict()
-        for i, question in enumerate(self.questions):
-            image_id = question.image_path.split("/")[-1].split(".")[0]
-            image_to_question_indices.setdefault(image_id, []).append(i)
-        images = list(image_to_question_indices.keys())
-        train_ids = [im for im in images if im not in test_ids]
-        train_idxs: List[int] = []
-        test_idxs: List[int] = []
-        for im in train_ids:
-            train_idxs.extend(image_to_question_indices[im])
-        for im in test_ids:
-            if im not in image_to_question_indices:
-                continue
-            test_idxs.extend(image_to_question_indices[im])
-        test_question_ids = [self.questions[i].question_id for i in test_idxs]
-        return (
-            Subset(self, train_idxs),
-            Subset(self, test_idxs),
-            test_question_ids,
-        )
 
 
 class AI2DDatasetForAutoEval(Dataset):
@@ -206,43 +182,46 @@ class AI2DDatasetForAutoEval(Dataset):
     def __len__(self):
         return self.length
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
         question_idx, answer_idx = self.answer_idx_to_question_idx[idx]
-        q = self.questions[question_idx]
+        q: MultipleChoiceQuestion = self.questions[question_idx]
         image = Image.open(q.image_path).convert("RGB")
-        input_text = get_input_text(q)
-        model_inputs = self.processor(images=image, text=input_text)
-        if self.include_labels:
-            target = q.answers[answer_idx]
-            add_labels_to_model_inputs(model_inputs, self.processor.tokenizer, target)
-            model_inputs["is_correct"] = q.correct_answer == answer_idx
-            model_inputs["question_id"] = q.question_id
-        return model_inputs
+        return {
+            "image": image,
+            "text": get_input_text(q),
+            "target": q.answers[answer_idx],
+            "is_correct": answer_idx == q.correct_answer,
+            "question_id": q.question_id,
+        }
 
 
 @dataclass
-class DataCollatorForMultimodal(object):
-    pad_token_id: int
+class FuyuDataCollator(object):
+    processor: FuyuProcessor
 
     def __call__(self, instances):
-        collated = {}
-        pad_values = {
-            "input_ids": -1,
-            "image_patches": 0,
-            "image_patches_indices": -1,
-            "labels": -100,
-        }
-        for key in pad_values.keys():
-            if key in instances[0]:
-                values = [instance[key].squeeze() for instance in instances]
-                collated[key] = pad_sequence(
-                    values, batch_first=True, padding_value=pad_values[key]
-                )
-        attention_mask = collated["input_ids"].ne(pad_values["input_ids"])
-        # Avoid overwriting `0` token if it is there.
-        collated["input_ids"][~attention_mask] = self.pad_token_id
-        collated["attention_mask"] = attention_mask
+        images = [instance["image"] for instance in instances]
+        texts = [
+            instance["text"] + BEGINNING_OF_ANSWER_STRING + instance["target"]
+            for instance in instances
+        ]
+        collated = self.processor(images=images, text=texts)
+        batch_size = collated["input_ids"].shape[0]
 
+        labels = copy.deepcopy(collated["input_ids"])
+        labels = torch.where(collated["attention_mask"].bool(), labels, -100)
+        for i in range(batch_size):
+            target_size = (
+                len(
+                    self.processor.tokenizer(
+                        instances[i]["target"], add_special_tokens=False
+                    )
+                )
+                + 1
+            )
+            labels[i, :-target_size] = -100
+
+        collated["labels"] = labels
         if "is_correct" in instances[0]:
             collated["is_correct"] = torch.tensor(
                 [instance["is_correct"] for instance in instances]
@@ -277,7 +256,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
 
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     dataset_for_auto_eval = AI2DDatasetForAutoEval(test_questions, processor)
-    data_collator = DataCollatorForMultimodal(pad_token_id=0)
+    data_collator = FuyuDataCollator(processor)
     if config.use_packed_sampler:
         lengths = np.array(
             [train_dataset.estimate_input_size(i) for i in range(len(train_dataset))]

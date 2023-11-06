@@ -14,10 +14,15 @@ def prepare_inputs(model_inputs, device, fdtype=torch.bfloat16):
     for k, v in model_inputs.items():
         if k in ("is_correct", "question_id"):
             continue
-        tensor = v.to(device)
-        if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16):
-            tensor = tensor.to(fdtype)
-        result[k] = tensor
+        if isinstance(v, torch.Tensor):
+            tensor = v.to(device)
+            if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                tensor = tensor.to(fdtype)
+            result[k] = tensor
+        elif isinstance(v, list) and isinstance(v[0], torch.Tensor):
+            result[k] = [v_.to(device) for v_ in v]
+        else:
+            result[k] = v
     return result
 
 

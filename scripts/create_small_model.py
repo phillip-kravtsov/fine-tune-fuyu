@@ -6,10 +6,18 @@ def main():
     config = tr.FuyuConfig.from_pretrained("adept/fuyu-8b")
     config.update(
         dict(
-            num_hidden_layers=6,
+            num_hidden_layers=2,
             num_attention_heads=32,
-            hidden_size=64,
-            intermediate_size=256,
+            hidden_size=128,
+            intermediate_size=512,
+        )
+    )
+    config.text_config.update(
+        dict(
+            num_hidden_layers=2,
+            num_attention_heads=32,
+            hidden_size=128,
+            intermediate_size=512,
         )
     )
     small_model = tr.FuyuForCausalLM(config).to(torch.bfloat16)
