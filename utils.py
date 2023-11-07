@@ -106,11 +106,11 @@ def get_image_from_inputs(
     inputs, idx=0, image_token=71011, image_nl_token=71019, patch_h=30, patch_w=30
 ):
     ids = inputs["input_ids"][idx].detach().cpu()
-    patches = inputs["image_patches"][idx].detach().cpu()
-    assert patches.shape[1] == patch_h * patch_w * 3
+    patches = inputs["image_patches"][idx].detach().cpu()[0]
+    assert patches.shape[1] == patch_h * patch_w * 3, patches.shape
     w, h = 0, 0
     # assumes variable size images (so includes raster order newlines)
-    for token in ids[idx]:
+    for token in ids:
         if token == image_token and h == 0:
             w += 1
         if token == image_nl_token:

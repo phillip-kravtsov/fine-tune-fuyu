@@ -73,7 +73,7 @@ def get_ai2d_questions(root_dir: str, skip_abc=False) -> List[MultipleChoiceQues
 
 
 def get_input_text(question: MultipleChoiceQuestion):
-    input_text = f"Answer the following multiple choice question: {question.question}\nPossible answers are:"
+    input_text = f"Answer the following multiple choice question: {question.question}\nPossible answers are:\n"
     for answer in question.answers:
         input_text += f"{answer}\n"
     return input_text
@@ -202,7 +202,10 @@ class FuyuDataCollator(object):
     def __call__(self, instances):
         images = [instance["image"] for instance in instances]
         texts = [
-            instance["text"] + BEGINNING_OF_ANSWER_STRING + instance["target"]
+            instance["text"]
+            + BEGINNING_OF_ANSWER_STRING
+            + instance["target"]
+            + self.processor.tokenizer.eos_token
             for instance in instances
         ]
         collated = self.processor(images=images, text=texts)
@@ -217,7 +220,7 @@ class FuyuDataCollator(object):
                         instances[i]["target"], add_special_tokens=False
                     )
                 )
-                + 1
+                + 2
             )
             labels[i, :-target_size] = -100
 
@@ -335,6 +338,9 @@ def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
         top_left = tuple(value["rectangle"][0])
         bottom_right = tuple(value["rectangle"][1])
         rectangle_height = bottom_right[1] - top_left[1]
+        if rectangle_height == 0:
+            print(text_annotation)
+            continue
         font = ImageFont.truetype(FONT_PATH, rectangle_height)
         draw.rectangle([top_left, bottom_right], fill=(255, 255, 255))
         replacement_text = value["replacementText"]
@@ -343,7 +349,7 @@ def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
 
 
 def create_overlay_images():
-    questions = get_ai2d_questions(AI2D_DATA_DIR, None, False)
+    questions = get_ai2d_questions(AI2D_DATA_DIR, False)
     for question in tqdm(questions):
         replace_text_and_save(AI2D_DATA_DIR, question)
 

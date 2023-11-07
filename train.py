@@ -1,12 +1,12 @@
 import argparse
 import functools
-import gc
 import glob
 import json
 import os
 import pprint
 import shutil
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Optional, Union
 
@@ -29,12 +29,7 @@ from torch.profiler import profile
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
-from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
-from transformers.models.persimmon.modeling_persimmon import (
-    PersimmonDecoderLayer,
-    PersimmonEmbedTokens,
-    PersimmonLMHead,
-)
+from transformers.models.persimmon.modeling_persimmon import PersimmonDecoderLayer
 
 import ai2d
 import eval
@@ -79,9 +74,7 @@ def get_lora_model(model, checkpoint_dir: str, config: Config):
         if "norm" in name:
             module = module.to(torch.float32)
         if "lm_head" in name or "embed_tokens" in name:
-            if hasattr(module, "weight"):
-                if module.weight.dtype == torch.float32:
-                    module = module.to(torch.bfloat16)
+            module = module.to(torch.bfloat16)
     return model
 
 
@@ -154,6 +147,7 @@ def load_model(config: Config):
         config.model_name_or_path,
         torch_dtype=torch.bfloat16,
         use_flash_attention_2=config.use_flash_attn,
+        device_map=f"cuda:{0}" if config.lora else None,
     )
 
     # Avoid conflicts with gradient checkpointing.
@@ -179,10 +173,10 @@ def init_model(config):
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
-                FuyuVisionEmbedTokens,
-                PersimmonEmbedTokens,
+                # FuyuVisionEmbedTokens,
+                # PersimmonEmbedTokens,
                 PersimmonDecoderLayer,
-                PersimmonLMHead,
+                # PersimmonLMHead,
             },
         )
         model = FSDP(
@@ -320,9 +314,11 @@ class Trainer:
 
     def throughput(self, batch):
         end_time = time.time()
-        ct = torch.tensor(batch["input_ids"].shape[0]).to(self.local_rank)
-        dist.all_reduce(ct, op=dist.ReduceOp.SUM)
-        self.throughput_counter += ct.cpu().item()
+        tokens = torch.tensor(
+            batch["input_ids"].shape[0] * batch["input_ids"].shape[1]
+        ).to(self.local_rank)
+        dist.all_reduce(tokens, op=dist.ReduceOp.SUM)
+        self.throughput_counter += tokens.cpu().item()
 
         if self.completed_steps % 10 == 0 and self.local_rank == 0:
             throughput = self.throughput_counter / (
@@ -336,10 +332,8 @@ class Trainer:
     def _profile_train_loop(self):
         with profile(profile_memory=True, record_shapes=True, with_stack=True) as prof:
             for batch in tqdm(self.train_dataloader, disable=(self.local_rank != 0)):
-                gc.collect()
-                torch.cuda.memory.empty_cache()
                 self.step(batch)
-                if self.completed_steps >= 10:
+                if self.completed_steps >= 2:
                     self.throughput(batch)
                     break
         export_profile(prof, self.local_rank)
@@ -348,12 +342,26 @@ class Trainer:
         model, optimizer, lr_scheduler = self.model, self.optimizer, self.lr_scheduler
         model.train()
         batch = utils.prepare_inputs(
-            batch, torch.cuda.current_device(), fdtype=torch.bfloat16
+            batch, f"cuda:{torch.cuda.current_device()}", fdtype=torch.bfloat16
         )
+        forward_context = torch.autocast("cuda") if self.config.lora else nullcontext
+        assert "image_patches" in batch and len(batch["image_patches"]) > 0, batch
+        """
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                print(k, v.shape)
+            if isinstance(v, list):
+                for i, tensor in enumerate(v):
+                    print(f"{k}.{i}", tensor.shape)
+        """
         try:
-            loss = model(**batch).loss
+            with forward_context:
+                loss = model(**batch).loss
             loss.backward()
-            model.clip_grad_norm_(1.0)
+            if hasattr(model, "clip_grad_norm_"):
+                model.clip_grad_norm_(1.0)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             optimizer.zero_grad()
             lr_scheduler.step()
@@ -384,6 +392,8 @@ class Trainer:
             self._profile_train_loop()
             return
 
+        if self.local_rank == 0:
+            print("Beginning train loop proper.")
         for batch in tqdm(self.train_dataloader, disable=(self.local_rank != 0)):
             self.step(batch)
 
@@ -430,15 +440,18 @@ def main():
         pprint.pprint(config)
         print(f"Using seed {config.seed}")
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    if "LOCAL_RANK" in os.environ:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+    else:
+        local_rank = 0
+        world_size = 1
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.cuda.set_device(local_rank)
     print("Initializing process group")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     model, tokenizer = init_model(config)
-    print(model)
     train_dataloader, eval_dataloader, max_train_steps = ai2d.get_data(
         config,
         world_size=world_size,

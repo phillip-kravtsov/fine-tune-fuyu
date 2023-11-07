@@ -5,7 +5,7 @@ from typing import Optional, Union, get_args, get_origin
 @dataclass
 class Config:
     model_name_or_path: str = field(default="adept/fuyu-8b")
-    max_eval_ids: Optional[int] = field(default=500)
+    max_eval_ids: Optional[int] = field(default=None)
     train_on_questions: bool = field(default=False)
     eval_batch_size: int = field(default=4)
     save_every_steps: int = field(default=1000)

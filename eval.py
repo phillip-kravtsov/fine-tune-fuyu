@@ -25,7 +25,9 @@ def do_eval(model, step, max_steps, eval_dataloader):
     model.train()
 
 
-def get_subbatches(batch, batch_size):
+def get_subbatches(batch, batch_size, gpu_poor=False):
+    if not gpu_poor:
+        return [batch]
     if batch_size > 1 and batch["input_ids"].shape[1] > 600:
         subbatches = [{} for _ in range(batch["input_ids"].shape[0])]
         for k, v in batch.items():
