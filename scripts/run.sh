@@ -1,5 +1,7 @@
 export TOKENIZERS_PARALLELISM=false
-torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 --rdzv-backend=c10d --rdzv-endpoint=localhost:25500 \
+export CUDA_VISIBLE_DEVICES=2,3
+
+torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=2 --rdzv-backend=c10d --rdzv-endpoint=localhost:25502 \
 	train.py \
   --eval_every_steps 100 \
   --save_every_steps 100 \

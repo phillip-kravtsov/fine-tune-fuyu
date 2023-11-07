@@ -261,6 +261,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     dataset_for_auto_eval = AI2DDatasetForAutoEval(test_questions, processor)
     data_collator = FuyuDataCollator(processor)
     if config.use_packed_sampler:
+        print("loading packed sampler--getting lengths")
         lengths = np.array(
             [train_dataset.estimate_input_size(i) for i in range(len(train_dataset))]
         )
@@ -278,6 +279,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
             batch_sampler=batch_sampler,
             num_workers=4,
         )
+        print("loading packed sampler--getting max_train_steps")
         max_train_steps = torch.tensor(len(train_dataloader)).long().to(local_rank)
         dist.all_reduce(max_train_steps, op=dist.ReduceOp.MIN)
         max_train_steps = max_train_steps.cpu().item()

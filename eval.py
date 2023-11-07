@@ -1,7 +1,11 @@
 from collections import defaultdict
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullyShardedDataParallel as FSDP,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -108,21 +112,32 @@ def auto_eval_dist(model, dataloader, rank, world_size):
 
     batch_size = dataloader.batch_size
     total = len(dataloader)
-    for i, batch in enumerate(tqdm(dataloader, total=total, disable=(rank != 0))):
-        subbatches = get_subbatches(batch, batch_size)
-        for subbatch in subbatches:
-            with torch.inference_mode():
-                try:
-                    outputs = model(**utils.prepare_inputs(subbatch, model.device))
-                except torch.cuda.OutOfMemoryError as e:
-                    print("Cuda OOM on input with shape", subbatch["input_ids"].shape)
-                    raise e
-                probs = get_label_log_probs(outputs.logits.float(), subbatch["labels"])
-            is_correct = subbatch["is_correct"]
-            question_ids = subbatch["question_id"]
-            id_tensors.append(question_ids)
-            is_correct_tensors.append(is_correct)
-            probs_tensors.append(probs)
+
+    with torch.inference_mode():
+        for i, batch in enumerate(tqdm(dataloader, total=total, disable=(rank != 0))):
+            subbatches = get_subbatches(batch, batch_size)
+            for subbatch in subbatches:
+                autocast_context = (
+                    torch.autocast("cuda")
+                    if not isinstance(model, FSDP)
+                    else nullcontext()
+                )
+                with autocast_context:
+                    try:
+                        outputs = model(**utils.prepare_inputs(subbatch, model.device))
+                        probs = get_label_log_probs(
+                            outputs.logits.float(), subbatch["labels"]
+                        )
+                    except torch.cuda.OutOfMemoryError as e:
+                        print(
+                            "Cuda OOM on input with shape", subbatch["input_ids"].shape
+                        )
+                        raise e
+                is_correct = subbatch["is_correct"]
+                question_ids = subbatch["question_id"]
+                id_tensors.append(question_ids)
+                is_correct_tensors.append(is_correct)
+                probs_tensors.append(probs)
     flat_probs = torch.cat(probs_tensors).to(rank)  # Should not be necessary.
     flat_ids = torch.cat(id_tensors).to(rank)
     flat_correct = torch.cat(is_correct_tensors).to(rank)

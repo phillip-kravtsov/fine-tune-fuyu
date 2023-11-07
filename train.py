@@ -344,7 +344,9 @@ class Trainer:
         batch = utils.prepare_inputs(
             batch, f"cuda:{torch.cuda.current_device()}", fdtype=torch.bfloat16
         )
-        forward_context = torch.autocast("cuda") if self.config.lora else nullcontext
+        forward_context = (
+            torch.autocast("cuda") if not isinstance(model, FSDP) else nullcontext()
+        )
         assert "image_patches" in batch and len(batch["image_patches"]) > 0, batch
         """
         for k, v in batch.items():
