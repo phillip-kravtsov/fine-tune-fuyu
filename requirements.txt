@@ -1,0 +1,5 @@
+wandb
+scipy
+peft
+transformers @ git+https://github.com/phillip-kravtsov/transformers@c0d1a7b5a2f2955757d132d1a1d329f5550f2ddb
+matplotlib

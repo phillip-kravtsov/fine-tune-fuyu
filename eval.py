@@ -1,9 +1,16 @@
 from collections import defaultdict
-import helpers
+from contextlib import nullcontext
+
 import torch
-import wandb
+import torch.distributed as dist
+from torch.distributed.fsdp.fully_sharded_data_parallel import (
+    FullyShardedDataParallel as FSDP,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+import utils
+import wandb
 
 
 def do_eval(model, step, max_steps, eval_dataloader):
@@ -13,16 +20,18 @@ def do_eval(model, step, max_steps, eval_dataloader):
     for i, batch in enumerate(tqdm(eval_dataloader, total=max_steps)):
         if max_steps is not None and i > max_steps:
             break
-        cleaned_batch = helpers.clean(batch, fdtype=torch.bfloat16)
+        cleaned_batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
         with torch.inference_mode(), torch.autocast("cuda"):
             loss = model(**cleaned_batch).loss
         losses.append(loss.item())
     avg_loss = sum(losses) / len(losses)
-    wandb.log({"step": step, "loss/val": avg_loss})
+    wandb.log({"loss/val": avg_loss}, step=step)
     model.train()
 
 
-def get_subbatches(batch, batch_size):
+def get_subbatches(batch, batch_size, gpu_poor=False):
+    if not gpu_poor:
+        return [batch]
     if batch_size > 1 and batch["input_ids"].shape[1] > 600:
         subbatches = [{} for _ in range(batch["input_ids"].shape[0])]
         for k, v in batch.items():
@@ -44,7 +53,20 @@ def get_subbatches(batch, batch_size):
     return subbatches
 
 
-def do_auto_eval(model, max_questions, dataloader: DataLoader):
+def get_label_log_probs(logits: torch.Tensor, labels: torch.Tensor):
+    shifted_logits = logits[:, :-1, :].contiguous()
+    shifted_labels = labels[..., 1:].contiguous().cuda()
+    log_probs = torch.nn.functional.log_softmax(shifted_logits, dim=-1)
+    non_ignore_indices = shifted_labels.ne(-100)
+    gather_indices = torch.where(non_ignore_indices, shifted_labels, 0)
+    selected_log_probs = torch.gather(
+        log_probs, 2, gather_indices.unsqueeze(-1)
+    ).squeeze(-1)
+    selected_log_probs = torch.where(non_ignore_indices, selected_log_probs, 0.0)
+    return torch.sum(selected_log_probs, dim=1)
+
+
+def do_auto_eval(model, dataloader: DataLoader):
     results_by_question_id = defaultdict(list)
     losses = []
     model.eval()
@@ -60,48 +82,106 @@ def do_auto_eval(model, max_questions, dataloader: DataLoader):
         return accuracy
 
     batch_size = dataloader.batch_size
-    total = (
-        ((max_questions * 4) // batch_size)
-        if max_questions is not None
-        else len(dataloader)
-    )
+    total = len(dataloader)
     for batch in tqdm(dataloader, total=total):
-        if (
-            max_questions is not None
-            and len(results_by_question_id) > max_questions + 1
-        ):
-            break
         subbatches = get_subbatches(batch, batch_size)
         for subbatch in subbatches:
-            with torch.inference_mode(), torch.autocast("cuda"):
+            with torch.inference_mode():
                 try:
-                    outputs = model(**helpers.clean(subbatch))
+                    outputs = model(**utils.prepare_inputs(subbatch, model.device))
                 except Exception as e:
                     print(subbatch["input_ids"].shape)
                     raise e
-                logits = outputs.logits
-                shifted_logits = logits[:, :-1, :].contiguous()
-                shifted_labels = subbatch["labels"][..., 1:].contiguous().cuda()
-                log_probs = torch.nn.functional.log_softmax(shifted_logits, dim=-1)
-                non_ignore_indices = shifted_labels.ne(-100)
-                gather_indices = torch.where(non_ignore_indices, shifted_labels, 0)
-                selected_log_probs = torch.gather(
-                    log_probs, 2, gather_indices.unsqueeze(-1)
-                ).squeeze(-1)
-                selected_log_probs = torch.where(
-                    non_ignore_indices, selected_log_probs, 0.0
-                )
-                sequence_log_prob = torch.sum(selected_log_probs, dim=1)
-                probs = torch.exp(sequence_log_prob).cpu().numpy()
+                probs = get_label_log_probs(outputs.logits, subbatch["labels"])
             is_correct = subbatch["is_correct"].cpu().numpy()
             loss = outputs.loss.cpu().numpy()
             question_ids = subbatch["question_id"]
             for j, question_id in enumerate(question_ids):
                 results_by_question_id[question_id].append((probs[j], is_correct[j]))
                 if is_correct[j]:
-                    if len(loss.shape):
-                        losses.append(loss[j])
-                    else:
-                        losses.append(loss.item())
+                    losses.append(loss[j] if len(loss.shape) else loss.item())
     model.train()
     return compute_accuracy(), sum(losses) / len(losses)
+
+
+def auto_eval_dist(model, dataloader, rank, world_size):
+    model.eval()
+    id_tensors = []
+    probs_tensors = []
+    is_correct_tensors = []
+
+    batch_size = dataloader.batch_size
+    total = len(dataloader)
+
+    with torch.inference_mode():
+        for i, batch in enumerate(tqdm(dataloader, total=total, disable=(rank != 0))):
+            subbatches = get_subbatches(batch, batch_size)
+            for subbatch in subbatches:
+                autocast_context = (
+                    torch.autocast("cuda")
+                    if not isinstance(model, FSDP)
+                    else nullcontext()
+                )
+                with autocast_context:
+                    try:
+                        outputs = model(**utils.prepare_inputs(subbatch, model.device))
+                        probs = get_label_log_probs(
+                            outputs.logits.float(), subbatch["labels"]
+                        )
+                    except torch.cuda.OutOfMemoryError as e:
+                        print(
+                            "Cuda OOM on input with shape", subbatch["input_ids"].shape
+                        )
+                        raise e
+                is_correct = subbatch["is_correct"]
+                question_ids = subbatch["question_id"]
+                id_tensors.append(question_ids)
+                is_correct_tensors.append(is_correct)
+                probs_tensors.append(probs)
+    flat_probs = torch.cat(probs_tensors).to(rank)  # Should not be necessary.
+    flat_ids = torch.cat(id_tensors).to(rank)
+    flat_correct = torch.cat(is_correct_tensors).to(rank)
+
+    our_length = torch.tensor(flat_ids.shape[0]).to(rank)
+    all_lens = [our_length for _ in range(world_size)]
+    dist.all_gather(all_lens, our_length)
+
+    if rank == 0:
+        gather_probs_list = [
+            torch.zeros(length.item()).to("cuda:0") for length in all_lens
+        ]
+        gather_ids_list = [
+            torch.zeros(length.item()).long().to("cuda:0") for length in all_lens
+        ]
+        gather_correct_list = [
+            torch.zeros(length.item()).bool().to("cuda:0") for length in all_lens
+        ]
+
+        dist.gather(flat_probs, gather_probs_list, dst=0)
+        dist.gather(flat_ids, gather_ids_list, dst=0)
+        dist.gather(flat_correct, gather_correct_list, dst=0)
+
+        all_probs = torch.cat(gather_probs_list)
+        all_ids = torch.cat(gather_ids_list)
+        all_correct = torch.cat(gather_correct_list)
+        by_question_id = defaultdict(list)
+        log_probs = []
+        for prob, id, correct in zip(all_probs, all_ids, all_correct):
+            by_question_id[id.item()].append((prob.item(), correct.item()))
+            if correct:
+                log_probs.append(prob.item())
+
+        correct_by_question_id = {}
+        for question_id, results in by_question_id.items():
+            results.sort(key=lambda x: x[0])
+            if len(results):
+                correct_by_question_id[question_id] = float(results[-1][1])
+
+        nll_loss = -sum(log_probs) / len(log_probs)
+        acc = sum(correct_by_question_id.values()) / len(correct_by_question_id)
+        return acc, nll_loss
+    else:
+        dist.gather(flat_probs, None, dst=0)
+        dist.gather(flat_ids, None, dst=0)
+        dist.gather(flat_correct, None, dst=0)
+        return None, None
