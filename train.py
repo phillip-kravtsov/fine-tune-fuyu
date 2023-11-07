@@ -324,7 +324,11 @@ class Trainer:
             throughput = self.throughput_counter / (
                 end_time - self.throughput_start_time
             )
-            print(f"Throughput: {throughput} elts/sec")
+            # doesn't really apply to LoRA.
+            achieved_teraflops = (throughput * 6 * 8e9) / 1e12
+            print(
+                f"Throughput: {round(throughput, 4)} tok/sec -> {round(achieved_teraflops, 3)} tflops"
+            )
             wandb.log({"throughput": throughput}, step=self.completed_steps)
             self.throughput_counter = 0
             self.throughput_start_time = time.time()

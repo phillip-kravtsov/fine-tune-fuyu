@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import os
+import random
 from dataclasses import dataclass
 from typing import List
 
@@ -198,6 +199,7 @@ class AI2DDatasetForAutoEval(Dataset):
 @dataclass
 class FuyuDataCollator(object):
     processor: FuyuProcessor
+    train_on_inputs: bool
 
     def __call__(self, instances):
         images = [instance["image"] for instance in instances]
@@ -222,6 +224,15 @@ class FuyuDataCollator(object):
                 )
                 + 2
             )
+            if self.train_on_inputs:
+                target_size += (
+                    len(
+                        self.processor.tokenizer(
+                            instances[i]["text"], add_special_tokens=False
+                        )
+                    )
+                    + 1
+                )
             labels[i, :-target_size] = -100
 
         collated["labels"] = labels
@@ -242,9 +253,12 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     processor = FuyuProcessor(
         image_processor=FuyuImageProcessor(),
         tokenizer=tokenizer,
+        add_beginning_of_answer_token=False,
     )
     processor.max_tokens_to_generate = 0
     test_ids = get_ai2d_test_ids()
+    random.seed(config.seed)
+    random.shuffle(test_ids)
     if config.max_eval_ids is not None:
         test_ids = test_ids[: config.max_eval_ids]
     test_ids = set(test_ids)
@@ -259,7 +273,9 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
 
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     dataset_for_auto_eval = AI2DDatasetForAutoEval(test_questions, processor)
-    data_collator = FuyuDataCollator(processor)
+    data_collator = FuyuDataCollator(
+        processor, train_on_inputs=config.train_on_questions
+    )
     if config.use_packed_sampler:
         print("loading packed sampler--getting lengths")
         lengths = np.array(
@@ -312,7 +328,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     auto_eval_dataloader = DataLoader(
         dataset_for_auto_eval,
         batch_size=config.eval_batch_size,
-        collate_fn=data_collator,
+        collate_fn=FuyuDataCollator(processor, False),
         pin_memory=True,
         sampler=auto_eval_sampler,
         worker_init_fn=utils.seed_worker,
