@@ -1,7 +1,7 @@
-{"image_path": "Screenshot 2023-10-20 at 3.08.53 PM.png", "questions": [{"question": "How many instance types are there?", "answers": ["14"]}, {"question": "How many instances are available?", "answers": ["0"]}, {"question": "Is a single GPU instance available?", "answers": ["no"]}]}
+{"image_path": "Screenshot 2023-10-20 at 3.08.53 PM.png", "questions": [{"question": "How many instance types are there?", "answers": [""]}, {"question": "How many instances are available?", "answers": []}, {"question": "Is a single GPU instance available?"}]}
 {"image_path": "Screenshot 2023-10-25 at 12.30.05 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-25 at 12.30.42 PM.png", "questions": []}
-{"image_path": "Screenshot 2023-10-20 at 3.10.36 PM.png", "questions": [{"question": "what does this input show?", "answers": ["confusion matrix", ""]}]}
+{"image_path": "Screenshot 2023-10-20 at 3.10.36 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-25 at 12.29.17 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.16.12 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-25 at 12.29.23 PM.png", "questions": []}
@@ -13,14 +13,14 @@
 {"image_path": "Screenshot 2023-10-25 at 12.30.11 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.13.29 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.10.14 PM.png", "questions": []}
-{"image_path": "Screenshot 2023-10-20 at 3.10.51 PM.png", "questions": []}
+{"image_path": "Screenshot 2023-10-20 at 3.10.51 PM.png", "questions": [{"question": "", "answers": [""]}]}
 {"image_path": "Screenshot 2023-10-23 at 9.05.26 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.14.15 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.13.11 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.10.20 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-25 at 12.28.23 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.13.56 PM.png", "questions": []}
-{"image_path": "Screenshot 2023-10-20 at 3.08.26 PM.png", "questions": []}
+{"image_path": "Screenshot 2023-10-20 at 3.08.26 PM.png", "questions": [{"question": "which run is running?", "answers": ["olive-music-12", ""]}, {"question": "what is the most recent failed run?", "answers": ["classic-terrain-6", ""]}, {"question": "", "answers": [""]}]}
 {"image_path": "Screenshot 2023-10-25 at 12.30.13 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-25 at 12.29.58 PM.png", "questions": []}
 {"image_path": "Screenshot 2023-10-20 at 3.15.25 PM.png", "questions": []}

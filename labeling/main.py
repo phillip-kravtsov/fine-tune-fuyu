@@ -48,6 +48,9 @@ def load_initial_data():
     return image_data
 
 image_data = load_initial_data()
+for i, datum in enumerate(image_data):
+    if datum['questions']:
+        print(i, datum['image_path'], datum['questions'])
 
 @app.post("/api/getData/")
 async def get_data():

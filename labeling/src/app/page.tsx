@@ -1,4 +1,4 @@
-import { ImageLabeler } from './imageLabeler';
+import { ImageLabeler } from './ImageLabeler';
 
 export default function Home() {
   return (
