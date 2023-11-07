@@ -273,6 +273,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
 
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     dataset_for_auto_eval = AI2DDatasetForAutoEval(test_questions, processor)
+    dataset_for_greedy_eval = AI2DMultipleChoiceDataset(test_questions, processor)
     data_collator = FuyuDataCollator(
         processor, train_on_inputs=config.train_on_questions
     )
@@ -333,7 +334,29 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         sampler=auto_eval_sampler,
         worker_init_fn=utils.seed_worker,
     )
-    return train_dataloader, auto_eval_dataloader, max_train_steps
+
+    greedy_eval_sampler = DistributedSampler(
+        dataset_for_greedy_eval,
+        num_replicas=world_size,
+        rank=local_rank,
+        shuffle=False,
+        seed=config.seed,
+    )
+    greedy_eval_dataloader = DataLoader(
+        dataset_for_greedy_eval,
+        batch_size=config.eval_batch_size,
+        collate_fn=FuyuDataCollator(processor, False),
+        pin_memory=True,
+        sampler=auto_eval_sampler,
+        worker_init_fn=utils.seed_worker,
+    )
+
+    return (
+        train_dataloader,
+        auto_eval_dataloader,
+        max_train_steps,
+        greedy_eval_dataloader,
+    )
 
 
 def replace_text_and_save(base_path, question: MultipleChoiceQuestion):

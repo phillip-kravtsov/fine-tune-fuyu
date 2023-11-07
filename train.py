@@ -16,6 +16,7 @@ import transformers
 from peft import PeftModel, get_peft_model
 from peft.tuners.lora import LoraConfig, LoraLayer
 from torch.distributed.fsdp.api import (
+    CPUOffload,
     FullStateDictConfig,
     MixedPrecision,
     ShardingStrategy,
@@ -29,7 +30,10 @@ from torch.profiler import profile
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
-from transformers.models.persimmon.modeling_persimmon import PersimmonDecoderLayer
+from transformers.models.persimmon.modeling_persimmon import (
+    PersimmonDecoderLayer,
+    PersimmonEmbedTokens,
+)
 
 import ai2d
 import eval
@@ -138,16 +142,18 @@ def get_latest_checkpoint_dir(run_name: str) -> str:
     return checkpoint_dir
 
 
-def load_model(config: Config):
+def load_model(config: Config, device_map=None):
     model_path = config.model_name_or_path
     if config.run_name is not None:
         model_path = get_latest_checkpoint_dir(config.run_name)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+    if device_map is None:
+        device_map = f"cuda:{0}" if config.lora else None
     model = transformers.FuyuForCausalLM.from_pretrained(
         config.model_name_or_path,
         torch_dtype=torch.bfloat16,
         use_flash_attention_2=config.use_flash_attn,
-        device_map=f"cuda:{0}" if config.lora else None,
+        device_map=device_map,
     )
 
     # Avoid conflicts with gradient checkpointing.
@@ -159,7 +165,6 @@ def load_model(config: Config):
     for name, module in model.named_modules():
         if hasattr(module, "weight"):
             assert module.weight.dtype == torch.bfloat16, f"{name} is not bfloat16"
-
     if config.lora:
         model = get_lora_model(model, model_path, config)
     elif config.run_name is not None:
@@ -174,7 +179,7 @@ def init_model(config):
             transformer_auto_wrap_policy,
             transformer_layer_cls={
                 # FuyuVisionEmbedTokens,
-                # PersimmonEmbedTokens,
+                PersimmonEmbedTokens,
                 PersimmonDecoderLayer,
                 # PersimmonLMHead,
             },
@@ -182,7 +187,7 @@ def init_model(config):
         model = FSDP(
             model,
             limit_all_gathers=True,
-            cpu_offload=None,
+            cpu_offload=CPUOffload(False),
             backward_prefetch=None,
             param_init_fn=None,
             auto_wrap_policy=auto_wrap_policy,
@@ -286,6 +291,7 @@ class Trainer:
         lr_scheduler,
         train_dataloader: DataLoader,
         eval_dataloader: DataLoader,
+        greedy_eval_dataloader: DataLoader,
         config: Config,
         local_rank: int,
         world_size: int,
@@ -298,6 +304,7 @@ class Trainer:
         self.lr_scheduler = lr_scheduler
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
+        self.greedy_eval_dataloader = greedy_eval_dataloader
         self.config = config
         self.local_rank = local_rank
         self.world_size = world_size
@@ -411,6 +418,12 @@ class Trainer:
                 self.save_model()
 
             if self.completed_steps % config.eval_every_steps == 0:
+                strict_accuracy = eval.greedy_eval(
+                    self.model,
+                    self.greedy_eval_dataloader,
+                    self.local_rank,
+                    self.world_size,
+                )
                 accuracy, loss = eval.auto_eval_dist(
                     self.model,
                     self.eval_dataloader,
@@ -419,10 +432,13 @@ class Trainer:
                 )
                 if self.local_rank == 0 and accuracy is not None:
                     wandb.log(
-                        {"accuracy/val": accuracy, "loss/val": loss},
+                        {
+                            "accuracy/val": accuracy,
+                            "loss/val": loss,
+                            "strict_accuracy/val": strict_accuracy,
+                        },
                         step=self.completed_steps,
                     )
-
             if self.completed_steps >= self.max_train_steps:
                 break
 
@@ -458,7 +474,12 @@ def main():
     print("Initializing process group")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     model, tokenizer = init_model(config)
-    train_dataloader, eval_dataloader, max_train_steps = ai2d.get_data(
+    (
+        train_dataloader,
+        eval_dataloader,
+        max_train_steps,
+        greedy_eval_dataloader,
+    ) = ai2d.get_data(
         config,
         world_size=world_size,
         local_rank=local_rank,
@@ -474,6 +495,7 @@ def main():
         world_size=world_size,
         train_dataloader=train_dataloader,
         eval_dataloader=eval_dataloader,
+        greedy_eval_dataloader=greedy_eval_dataloader,
         config=config,
     )
     trainer.train()

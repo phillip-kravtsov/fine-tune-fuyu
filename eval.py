@@ -185,3 +185,55 @@ def auto_eval_dist(model, dataloader, rank, world_size):
         dist.gather(flat_ids, None, dst=0)
         dist.gather(flat_correct, None, dst=0)
         return None, None
+
+
+def greedy_eval(model, dataloader, rank, world_size):
+    model.eval()
+    batch_size = dataloader.batch_size
+    total = len(dataloader)
+    correct_tensors = []
+
+    autocast_context = (
+        torch.autocast("cuda") if not isinstance(model, FSDP) else nullcontext()
+    )
+    with torch.inference_mode():
+        for i, batch in enumerate(tqdm(dataloader, total=total, disable=(rank != 0))):
+            subbatches = get_subbatches(batch, batch_size)
+            for subbatch in subbatches:
+                with autocast_context:
+                    try:
+                        outputs = model(**utils.prepare_inputs(subbatch, model.device))
+                    except torch.cuda.OutOfMemoryError as e:
+                        print(
+                            "Cuda OOM on input with shape", subbatch["input_ids"].shape
+                        )
+                        raise e
+                logits = outputs.logits.float()
+                labels = subbatch["labels"]
+                shifted_logits = logits[:, :-1, :].contiguous()
+                shifted_labels = labels[..., 1:].contiguous().to(rank)
+                argmax = torch.argmax(shifted_logits, dim=-1)
+                b = labels.shape[0]
+                for j in range(b):
+                    non_ignore_indices = shifted_labels[j] != -100
+                    targets = shifted_labels[j][non_ignore_indices]
+                    greedy = argmax[j][non_ignore_indices]
+                    is_correct = torch.all(targets == greedy).view(1)
+                    correct_tensors.append(is_correct)
+
+    flat_correct = torch.cat(correct_tensors).to(rank)
+    rank_length = torch.tensor(flat_correct.shape[0]).to(rank)
+    lengths = [rank_length for _ in range(world_size)]
+    dist.all_gather(lengths, rank_length)
+
+    if rank == 0:
+        gather_correct_list = [
+            torch.zeros(length.item()).bool().to("cuda:0") for length in all_lens
+        ]
+        dist.gather(flat_correct, gather_correct_list, dst=0)
+        all_correct = torch.cat(gather_correct_list)
+        accuracy = all_correct.float().mean()
+        return accuracy
+    else:
+        dist.gather(flat_correct, None, dst=0)
+        return None

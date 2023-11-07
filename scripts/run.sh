@@ -5,13 +5,13 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=2 --rdzv-bac
 	train.py \
   --eval_every_steps 100 \
   --save_every_steps 100 \
-  --per_device_batch_size 6 \
-  --eval_batch_size 4 \
+  --per_device_batch_size 1 \
+  --eval_batch_size 1 \
   --learning_rate 2e-5 \
   --seed 102 \
   --weight_decay 0.0 \
   --max_eval_ids 200 \
   --model_name_or_path "fuyu-8b-slim-vocab" \
+  --use_flash_attn \
 #  --profile \
 #  --use_packed_sampler \
-#  --use_flash_attn \
