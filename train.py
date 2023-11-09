@@ -36,6 +36,7 @@ from transformers.models.persimmon.modeling_persimmon import (
 )
 
 import ai2d
+import scienceqa
 import eval
 import utils
 import wandb
@@ -290,7 +291,7 @@ class Trainer:
         optimizer,
         lr_scheduler,
         train_dataloader: DataLoader,
-        eval_dataloader: DataLoader,
+        eval_dataloader: Optional[DataLoader],
         greedy_eval_dataloader: DataLoader,
         config: Config,
         local_rank: int,
@@ -418,25 +419,29 @@ class Trainer:
                 self.save_model()
 
             if self.completed_steps % config.eval_every_steps == 0:
-                strict_accuracy = eval.greedy_eval(
+                to_log = {}
+                strict_accuracy, loss = eval.greedy_eval(
                     self.model,
                     self.greedy_eval_dataloader,
                     self.local_rank,
                     self.world_size,
                 )
-                accuracy, loss = eval.auto_eval_dist(
-                    self.model,
-                    self.eval_dataloader,
-                    self.local_rank,
-                    self.world_size,
-                )
-                if self.local_rank == 0 and accuracy is not None:
+                to_log["strict_accuracy/val"] = strict_accuracy
+                to_log["loss/val"] = loss
+
+                if self.eval_dataloader is not None:
+                    accuracy, loss = eval.auto_eval_dist(
+                        self.model,
+                        self.eval_dataloader,
+                        self.local_rank,
+                        self.world_size,
+                    )
+                    to_log["accuracy/val"] = accuracy
+                    to_log["loss/val-auto"] = loss
+
+                if self.local_rank == 0:
                     wandb.log(
-                        {
-                            "accuracy/val": accuracy,
-                            "loss/val": loss,
-                            "strict_accuracy/val": strict_accuracy,
-                        },
+                        to_log,
                         step=self.completed_steps,
                     )
             if self.completed_steps >= self.max_train_steps:
@@ -474,17 +479,33 @@ def main():
     print("Initializing process group")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     model, tokenizer = init_model(config)
-    (
-        train_dataloader,
-        eval_dataloader,
-        max_train_steps,
-        greedy_eval_dataloader,
-    ) = ai2d.get_data(
-        config,
-        world_size=world_size,
-        local_rank=local_rank,
-        tokenizer=tokenizer,
-    )
+    if config.dataset == 'ai2d':
+        (
+            train_dataloader,
+            eval_dataloader,
+            max_train_steps,
+            greedy_eval_dataloader,
+        ) = ai2d.get_data(
+            config,
+            world_size=world_size,
+            local_rank=local_rank,
+            tokenizer=tokenizer,
+        )
+    elif config.dataset == 'scienceqa':
+        (
+            train_dataloader,
+            eval_dataloader,
+            max_train_steps,
+            greedy_eval_dataloader,
+        ) = scienceqa.get_data(
+            config,
+            world_size=world_size,
+            local_rank=local_rank,
+            tokenizer=tokenizer,
+        )
+    else:
+        raise ValueError(f"Unknown dataset {config.dataset}")
+
     optimizer, lr_scheduler = get_optimizer(model, max_train_steps, config)
     trainer = Trainer(
         model=model,

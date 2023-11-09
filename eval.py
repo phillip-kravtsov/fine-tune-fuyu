@@ -192,6 +192,7 @@ def greedy_eval(model, dataloader, rank, world_size):
     batch_size = dataloader.batch_size
     total = len(dataloader)
     correct_tensors = []
+    loss_tensors = []
 
     autocast_context = (
         torch.autocast("cuda") if not isinstance(model, FSDP) else nullcontext()
@@ -208,12 +209,15 @@ def greedy_eval(model, dataloader, rank, world_size):
                             "Cuda OOM on input with shape", subbatch["input_ids"].shape
                         )
                         raise e
-                logits = outputs.logits.float()
                 labels = subbatch["labels"]
+                b = labels.shape[0]
+                logits = outputs.logits.float()
+                loss = outputs.loss.item()
+                loss_tensors.append(torch.tensor([loss.item()] * b))
+
                 shifted_logits = logits[:, :-1, :].contiguous()
                 shifted_labels = labels[..., 1:].contiguous().to(rank)
                 argmax = torch.argmax(shifted_logits, dim=-1)
-                b = labels.shape[0]
                 for j in range(b):
                     non_ignore_indices = shifted_labels[j] != -100
                     targets = shifted_labels[j][non_ignore_indices]
@@ -222,18 +226,25 @@ def greedy_eval(model, dataloader, rank, world_size):
                     correct_tensors.append(is_correct)
 
     flat_correct = torch.cat(correct_tensors).to(rank)
+    flat_loss = torch.cat(loss_tensors).item()
     rank_length = torch.tensor(flat_correct.shape[0]).to(rank)
     lengths = [rank_length for _ in range(world_size)]
     dist.all_gather(lengths, rank_length)
 
     if rank == 0:
         gather_correct_list = [
-            torch.zeros(length.item()).bool().to("cuda:0") for length in all_lens
+            torch.zeros(length.item()).bool().to("cuda:0") for length in lengths
+        ]
+        gather_loss_list = [
+            torch.zeros(length.item()).to("cuda:0") for length in lengths
         ]
         dist.gather(flat_correct, gather_correct_list, dst=0)
+        dist.gather(flat_loss, gather_loss_list, dst=0)
         all_correct = torch.cat(gather_correct_list)
         accuracy = all_correct.float().mean()
-        return accuracy
+        avg_loss = torch.cat(gather_loss_list).mean()
+        return accuracy, avg_loss
     else:
         dist.gather(flat_correct, None, dst=0)
-        return None
+        dist.gather(flat_loss, None, dst=0)
+        return None, None

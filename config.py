@@ -26,6 +26,7 @@ class Config:
     use_flash_attn: bool = field(default=False)
     profile: bool = field(default=False)
     use_packed_sampler: bool = field(default=False)
+    dataset: str = field(default="ai2d")
 
 
 def parse_args(parser) -> Config:

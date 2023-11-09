@@ -197,7 +197,7 @@ class AI2DDatasetForAutoEval(Dataset):
 
 
 @dataclass
-class FuyuDataCollator(object):
+class FuyuCollator(object):
     processor: FuyuProcessor
     train_on_inputs: bool
 
@@ -274,7 +274,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     dataset_for_auto_eval = AI2DDatasetForAutoEval(test_questions, processor)
     dataset_for_greedy_eval = AI2DMultipleChoiceDataset(test_questions, processor)
-    data_collator = FuyuDataCollator(
+    data_collator = FuyuCollator(
         processor, train_on_inputs=config.train_on_questions
     )
     if config.use_packed_sampler:
@@ -329,7 +329,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     auto_eval_dataloader = DataLoader(
         dataset_for_auto_eval,
         batch_size=config.eval_batch_size,
-        collate_fn=FuyuDataCollator(processor, False),
+        collate_fn=FuyuCollator(processor, False),
         pin_memory=True,
         sampler=auto_eval_sampler,
         worker_init_fn=utils.seed_worker,
@@ -345,9 +345,9 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     greedy_eval_dataloader = DataLoader(
         dataset_for_greedy_eval,
         batch_size=config.eval_batch_size,
-        collate_fn=FuyuDataCollator(processor, False),
+        collate_fn=FuyuCollator(processor, False),
         pin_memory=True,
-        sampler=auto_eval_sampler,
+        sampler=greedy_eval_sampler,
         worker_init_fn=utils.seed_worker,
     )
 
