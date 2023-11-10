@@ -212,7 +212,7 @@ def greedy_eval(model, dataloader, rank, world_size):
                 b = labels.shape[0]
                 logits = outputs.logits.float()
                 loss = outputs.loss.item()
-                loss_tensors.append(torch.tensor([loss.item()] * b))
+                loss_tensors.append(torch.tensor([loss] * b))
 
                 shifted_logits = logits[:, :-1, :].contiguous()
                 shifted_labels = labels[..., 1:].contiguous().to(rank)
@@ -225,7 +225,7 @@ def greedy_eval(model, dataloader, rank, world_size):
                     correct_tensors.append(is_correct)
 
     flat_correct = torch.cat(correct_tensors).to(rank)
-    flat_loss = torch.cat(loss_tensors).item()
+    flat_loss = torch.cat(loss_tensors).to(rank)
     rank_length = torch.tensor(flat_correct.shape[0]).to(rank)
     lengths = [rank_length for _ in range(world_size)]
     dist.all_gather(lengths, rank_length)

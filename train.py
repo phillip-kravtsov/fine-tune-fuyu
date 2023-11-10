@@ -8,7 +8,7 @@ import shutil
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Any
 
 import torch
 import torch.distributed as dist
@@ -412,26 +412,7 @@ class Trainer:
                 self.save_model()
 
             if self.completed_steps % config.eval_every_steps == 0:
-                to_log = {}
-                strict_accuracy, loss = eval.greedy_eval(
-                    self.model,
-                    self.greedy_eval_dataloader,
-                    self.local_rank,
-                    self.world_size,
-                )
-                to_log["strict_accuracy/val"] = strict_accuracy
-                to_log["loss/val"] = loss
-
-                if self.eval_dataloader is not None:
-                    accuracy, loss = eval.auto_eval_dist(
-                        self.model,
-                        self.eval_dataloader,
-                        self.local_rank,
-                        self.world_size,
-                    )
-                    to_log["accuracy/val"] = accuracy
-                    to_log["loss/val-auto"] = loss
-
+                to_log = self.eval("val")
                 if self.local_rank == 0:
                     wandb.log(
                         to_log,
@@ -440,13 +421,34 @@ class Trainer:
             if self.completed_steps >= self.max_train_steps:
                 break
 
-        accuracy, loss = eval.auto_eval_dist(
-            self.model, self.eval_dataloader, self.local_rank, self.world_size
-        )
+        eval_log = self.eval("final")
+
         if self.local_rank == 0:
-            wandb.log({"accuracy/final": accuracy, "loss/final": loss})
+            wandb.log(eval_log)
         self.save_model("final")
 
+    def eval(self, suffix: str) -> Dict[str, Any]:
+        to_log = {}
+        if self.greedy_eval_dataloader is not None:
+            strict_accuracy, loss = eval.greedy_eval(
+                self.model,
+                self.greedy_eval_dataloader,
+                self.local_rank,
+                self.world_size,
+            )
+            to_log[f"strict_accuracy/{suffix}"] = strict_accuracy
+            to_log[f"loss/{suffix}"] = loss
+
+        if self.eval_dataloader is not None:
+            accuracy, loss = eval.auto_eval_dist(
+                self.model,
+                self.eval_dataloader,
+                self.local_rank,
+                self.world_size,
+            )
+            to_log[f"accuracy/{suffix}"] = accuracy
+            to_log[f"loss-auto/{suffix}"] = loss
+        return to_log
 
 def main():
     local_rank = int(os.environ["LOCAL_RANK"])
