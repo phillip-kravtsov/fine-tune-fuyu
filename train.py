@@ -13,33 +13,26 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 import transformers
+import wandb
 from peft import PeftModel, get_peft_model
 from peft.tuners.lora import LoraConfig, LoraLayer
-from torch.distributed.fsdp.api import (
-    CPUOffload,
-    FullStateDictConfig,
-    MixedPrecision,
-    ShardingStrategy,
-    StateDictType,
-)
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    FullyShardedDataParallel as FSDP,
-)
+from torch.distributed.fsdp.api import (CPUOffload, FullStateDictConfig,
+                                        MixedPrecision, ShardingStrategy,
+                                        StateDictType)
+from torch.distributed.fsdp.fully_sharded_data_parallel import \
+    FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.profiler import profile
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import FuyuForCausalLM, get_scheduler
 from transformers.models.persimmon.modeling_persimmon import (
-    PersimmonDecoderLayer,
-    PersimmonEmbedTokens,
-)
+    PersimmonDecoderLayer, PersimmonEmbedTokens)
 
 import ai2d
-import scienceqa
 import eval
+import scienceqa
 import utils
-import wandb
 from config import Config, parse_args
 
 OUTPUT_DIR = "/workspace/fuyu/output"

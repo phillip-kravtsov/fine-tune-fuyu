@@ -3,14 +3,13 @@ from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    FullyShardedDataParallel as FSDP,
-)
+import wandb
+from torch.distributed.fsdp.fully_sharded_data_parallel import \
+    FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import utils
-import wandb
 
 
 def do_eval(model, step, max_steps, eval_dataloader):

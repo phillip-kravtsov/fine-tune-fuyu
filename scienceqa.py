@@ -1,10 +1,13 @@
-import datasets
 from typing import Dict
-from config import Config
+
+import datasets
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from transformers import FuyuImageProcessor, FuyuProcessor
-from ai2d import FuyuCollator
 from tqdm import tqdm
+from transformers import FuyuImageProcessor, FuyuProcessor
+
+from ai2d import FuyuCollator
+from config import Config
+
 
 class ScienceQADataset(Dataset):
     def __init__(self,
