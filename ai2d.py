@@ -14,10 +14,10 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
 
+import data as fuyu_data
 import utils
 from config import Config
 from sampler import PackedDistributedBatchSampler
-import data as fuyu_data
 
 AI2D_DATA_DIR = "/workspace/ai2d"
 FONT_PATH = "/workspace/Arial.ttf"
@@ -177,8 +177,6 @@ class AI2DMultipleAnswerDataset(Dataset):
         }
 
 
-
-
 def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     # Cache vocab to fix performance issues.
     vocab = tokenizer.get_vocab()
@@ -206,7 +204,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         )
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     val_dataset = AI2DMultipleChoiceDataset(test_questions, processor)
-    dataset_for_multiple_choice = AI2DMultipleAnswerDataset(test_questions, processor)
+    multiple_answer_dataset = AI2DMultipleAnswerDataset(test_questions, processor)
     data_collator = fuyu_data.FuyuCollator(
         processor, train_on_inputs=config.train_on_questions
     )
@@ -251,7 +249,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         max_train_steps = len(train_dataloader)
 
     multiple_choice_sampler = DistributedSampler(
-        dataset_for_multiple_choice,
+        multiple_answer_dataset,
         num_replicas=world_size,
         rank=local_rank,
         shuffle=False,
@@ -259,7 +257,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     )
 
     multiple_choice_dataloader = DataLoader(
-        dataset_for_multiple_choice,
+        multiple_answer_dataset,
         batch_size=config.eval_batch_size,
         collate_fn=fuyu_data.FuyuCollator(processor, False),
         pin_memory=True,

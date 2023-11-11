@@ -1,23 +1,22 @@
-import datasets
 from typing import Dict
-from config import Config
+
+import datasets
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
-from transformers import FuyuImageProcessor, FuyuProcessor
-from ai2d import FuyuCollator
 from tqdm import tqdm
+from transformers import FuyuImageProcessor, FuyuProcessor
+
+from config import Config
+from data import FuyuCollator
+
 
 class ScienceQADataset(Dataset):
-    def __init__(self,
-                 dataset: datasets.Dataset,
-                 images_only: bool = True):
+    def __init__(self, dataset: datasets.Dataset, images_only: bool = True):
         self.images_only = images_only
         if self.images_only:
-            self.dataset = [
-                d for d in tqdm(dataset) if d['image'] is not None
-            ]
+            self.dataset = [d for d in tqdm(dataset) if d["image"] is not None]
         else:
             self.dataset = dataset
-    
+
     def __len__(self):
         return len(self.dataset)
 
@@ -30,21 +29,21 @@ class ScienceQADataset(Dataset):
 
     def __getitem__(self, idx):
         question = self.dataset[idx]
-        image = question['image'].convert("RGB")
+        image = question["image"].convert("RGB")
         return {
             "image": image,
             "text": ScienceQADataset.get_input_text(question),
-            "target": question['choices'][question['answer']],
+            "target": question["choices"][question["answer"]],
         }
 
 
 def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     # TODO: put this back. Getting issues with pikcling in dataloader.
-    #vocab = tokenizer.get_vocab()
-    
-    #def get_vocab():
+    # vocab = tokenizer.get_vocab()
+
+    # def get_vocab():
     #    return vocab
-    #tokenizer.get_vocab = get_vocab
+    # tokenizer.get_vocab = get_vocab
     processor = FuyuProcessor(
         image_processor=FuyuImageProcessor(),
         tokenizer=tokenizer,
@@ -52,8 +51,8 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
     )
     processor.max_tokens_to_generate = 0
     full_dataset = datasets.load_dataset("derek-thomas/ScienceQA")
-    train_dataset = ScienceQADataset(full_dataset['train'], True)
-    validation_dataset = ScienceQADataset(full_dataset['validation'], True)
+    train_dataset = ScienceQADataset(full_dataset["train"], True)
+    validation_dataset = ScienceQADataset(full_dataset["validation"], True)
     collator = FuyuCollator(processor, train_on_inputs=config.train_on_questions)
     if config.use_packed_sampler:
         raise NotImplementedError("Packed sampler not implemented for ScienceQA.")
@@ -73,7 +72,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
             pin_memory=True,
         )
         max_train_steps = len(train_dataloader)
-    
+
     validation_sampler = DistributedSampler(
         validation_dataset,
         num_replicas=world_size,
@@ -89,4 +88,3 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         pin_memory=True,
     )
     return train_dataloader, None, max_train_steps, validation_dataloader
-
