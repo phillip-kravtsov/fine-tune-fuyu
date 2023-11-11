@@ -40,6 +40,7 @@ import eval
 import lora
 import scienceqa
 import utils
+import wandb
 from config import Config, parse_args
 from utils import get_checkpoint_dir, get_run_dir
 

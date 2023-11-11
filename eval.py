@@ -11,22 +11,6 @@ from tqdm import tqdm
 import utils
 
 
-def do_eval(model, step, max_steps, eval_dataloader):
-    losses = []
-    print("Doing evaluation.")
-    model.eval()
-    for i, batch in enumerate(tqdm(eval_dataloader, total=max_steps)):
-        if max_steps is not None and i > max_steps:
-            break
-        cleaned_batch = utils.prepare_inputs(batch, model.device, fdtype=torch.bfloat16)
-        with torch.inference_mode(), torch.autocast("cuda"):
-            loss = model(**cleaned_batch).loss
-        losses.append(loss.item())
-    avg_loss = sum(losses) / len(losses)
-    wandb.log({"loss/val": avg_loss}, step=step)
-    model.train()
-
-
 def get_subbatches(batch, batch_size, gpu_poor=False):
     if not gpu_poor:
         return [batch]
