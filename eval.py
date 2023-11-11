@@ -37,7 +37,7 @@ def get_subbatches(batch, batch_size, gpu_poor=False):
 
 def get_label_log_probs(logits: torch.Tensor, labels: torch.Tensor):
     shifted_logits = logits[:, :-1, :].contiguous()
-    shifted_labels = labels[..., 1:].contiguous().cuda()
+    shifted_labels = labels[..., 1:].contiguous()
     log_probs = torch.nn.functional.log_softmax(shifted_logits, dim=-1)
     non_ignore_indices = shifted_labels.ne(-100)
     gather_indices = torch.where(non_ignore_indices, shifted_labels, 0)
@@ -47,6 +47,19 @@ def get_label_log_probs(logits: torch.Tensor, labels: torch.Tensor):
     selected_log_probs = torch.where(non_ignore_indices, selected_log_probs, 0.0)
     return torch.sum(selected_log_probs, dim=1)
 
+def are_labels_most_likely(logits: torch.Tensor, labels: torch.Tensor):
+    shifted_logits = logits[:, :-1, :].contiguous()
+    shifted_labels = labels[..., 1:].contiguous()
+    argmax = torch.argmax(shifted_logits, dim=-1)
+    b = shifted_labels.shape[0]
+    correct = torch.zeros(b).bool()
+    for i in range(b):
+        non_ignore_indices = shifted_labels[i] != -100
+        targets = shifted_labels[i][non_ignore_indices]
+        greedy = argmax[i][non_ignore_indices]
+        is_correct = torch.all(targets == greedy).view(1)
+        correct[i] = is_correct
+    return correct
 
 def likelihood_eval(model, dataloader, rank, world_size):
     model.eval()
@@ -77,10 +90,8 @@ def likelihood_eval(model, dataloader, rank, world_size):
                             "Cuda OOM on input with shape", subbatch["input_ids"].shape
                         )
                         raise e
-                is_correct = subbatch["is_correct"]
-                question_ids = subbatch["question_id"]
-                id_tensors.append(question_ids)
-                is_correct_tensors.append(is_correct)
+                id_tensors.append(subbatch["question_id"])
+                is_correct_tensors.append(subbatch["is_correct"])
                 probs_tensors.append(probs)
 
     flat_probs = torch.cat(probs_tensors).to(rank)  # Should not be necessary.
@@ -147,7 +158,7 @@ def greedy_eval(model, dataloader, rank, world_size):
         torch.autocast("cuda") if not isinstance(model, FSDP) else nullcontext()
     )
     with torch.inference_mode():
-        for i, batch in enumerate(tqdm(dataloader, total=total, disable=(rank != 0))):
+        for batch in tqdm(dataloader, total=total, disable=(rank != 0)):
             subbatches = get_subbatches(batch, batch_size)
             for subbatch in subbatches:
                 with autocast_context:
@@ -158,21 +169,12 @@ def greedy_eval(model, dataloader, rank, world_size):
                             "Cuda OOM on input with shape", subbatch["input_ids"].shape
                         )
                         raise e
-                labels = subbatch["labels"]
+                labels = subbatch["labels"].to(rank)
                 b = labels.shape[0]
                 logits = outputs.logits.float()
+                correct_tensors.append(are_labels_most_likely(logits, labels))
                 loss = outputs.loss.item()
                 loss_tensors.append(torch.tensor([loss] * b))
-
-                shifted_logits = logits[:, :-1, :].contiguous()
-                shifted_labels = labels[..., 1:].contiguous().to(rank)
-                argmax = torch.argmax(shifted_logits, dim=-1)
-                for j in range(b):
-                    non_ignore_indices = shifted_labels[j] != -100
-                    targets = shifted_labels[j][non_ignore_indices]
-                    greedy = argmax[j][non_ignore_indices]
-                    is_correct = torch.all(targets == greedy).view(1)
-                    correct_tensors.append(is_correct)
 
     flat_correct = torch.cat(correct_tensors).to(rank)
     flat_loss = torch.cat(loss_tensors).to(rank)

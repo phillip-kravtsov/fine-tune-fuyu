@@ -251,7 +251,7 @@ class Trainer:
 
     def _init_tracking(self):
         if self.local_rank == 0:
-            wandb.init(project="fuyu", config=self.config.__dict__)
+            wandb.init(project=f"fuyu-{self.config.dataset}", config=self.config.__dict__)
             if wandb.run is None:
                 raise Exception
             save_config(self.config, wandb.run.name)
