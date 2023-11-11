@@ -14,6 +14,8 @@ class Config:
     learning_rate: float = field(default=3e-4)
     scheduler_type: str = field(default="constant")
     warmup_steps: int = field(default=200)
+    gradient_checkpointing: bool = field(default=False)
+    fsdp: bool = field(default=False)
     lora: bool = field(default=False)
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=32)
@@ -54,4 +56,5 @@ def parse_args(parser) -> Config:
             parser.add_argument(f"--{name}", type=actual_type, default=default)
     args = parser.parse_args()
     config = Config(**vars(args))
+    assert not config.lora and config.fsdp, "Peft is not supported with FSDP."
     return config
