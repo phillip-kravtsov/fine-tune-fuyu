@@ -28,9 +28,11 @@ from torch.profiler import profile
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import get_scheduler
+from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
 from transformers.models.persimmon.modeling_persimmon import (
     PersimmonDecoderLayer,
     PersimmonEmbedTokens,
+    PersimmonLMHead,
 )
 
 import ai2d
@@ -125,8 +127,8 @@ def load_model(config: Config, device_map=None):
         auto_wrap_policy = functools.partial(
             transformer_auto_wrap_policy,
             transformer_layer_cls={
-                # FuyuVisionEmbedTokens,
-                # PersimmonLMHead,
+                FuyuVisionEmbedTokens,
+                PersimmonLMHead,
                 PersimmonEmbedTokens,
                 PersimmonDecoderLayer,
             },

@@ -136,7 +136,8 @@ class AI2DMultipleChoiceDataset(Dataset):
             q.answers[q.correct_answer], add_special_tokens=False
         )
         padded_h, padded_w = fuyu_data.get_padding_dims(
-            *fuyu_data.get_scale_dims(h, w),
+            *fuyu_data.get_scale_dims(h, w, self.processor.image_processor),
+            self.processor.image_processor
         )
         new_h = min(padded_h, math.ceil(h / patch_h) * patch_h)
         new_w = min(padded_w, math.ceil(w / patch_w) * patch_w)
@@ -214,7 +215,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
             [train_dataset.estimate_input_size(i) for i in range(len(train_dataset))]
         )
         batch_sampler = PackedDistributedBatchSampler(
-            batch_max_length=max(lengths) * config.per_device_batch_size,
+            batch_max_length=(max(lengths) + 1) * config.per_device_batch_size,
             lengths=lengths,
             num_replicas=world_size,
             rank=local_rank,

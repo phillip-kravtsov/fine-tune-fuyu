@@ -14,6 +14,6 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 --rdzv-bac
   --fsdp \
   --gradient_checkpointing \
   --model_name_or_path "fuyu-8b-slim-vocab" \
-  --profile \
+#  --profile \
 #  --use_packed_sampler \
 #  --max_eval_ids 200 \
