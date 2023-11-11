@@ -42,7 +42,7 @@ class PackedDistributedBatchSampler(Sampler):
         for index, length in zip(sort_indices, sorted_lengths):
             assert length < self.batch_max_length
             if (
-                sum([x[1] for x in bins[-1]]) + length > self.batch_max_length
+                sum([x[1] for x in bins[-1]]) + length < self.batch_max_length
                 and len(bins[-1]) < 64
             ):
                 bins.append([(index, length)])
