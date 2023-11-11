@@ -124,4 +124,4 @@ def get_image_from_inputs(
                 i * patch_h : (i + 1) * patch_h, j * patch_w : (j + 1) * patch_w, :
             ] = patches[patch_idx].view(patch_h, patch_w, 3)
     scaled = (((imarr + 1) / 2) * 255).astype(np.uint8)
-    return Image.fromarray(scaled)
+    return Image.fromarray(scaled), (w, h)

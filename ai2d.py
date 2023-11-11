@@ -13,11 +13,11 @@ from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
-from transformers.models.fuyu.processing_fuyu import BEGINNING_OF_ANSWER_STRING
 
 import utils
 from config import Config
 from sampler import PackedDistributedBatchSampler
+import data as fuyu_data
 
 AI2D_DATA_DIR = "/workspace/ai2d"
 FONT_PATH = "/workspace/Arial.ttf"
@@ -126,26 +126,7 @@ class AI2DMultipleChoiceDataset(Dataset):
             "question_id": q.question_id,
         }
 
-    # these are not really AI2D specific
-    def pad(self, image_height, image_width):
-        ip = self.processor.image_processor
-        padding_bottom = ip.size["height"] - image_height
-        padding_right = ip.size["width"] - image_width
-        return image_height + padding_bottom, image_width + padding_right
-
-    def scale(self, image_height, image_width):
-        ip = self.processor.image_processor
-        if image_width <= ip.size["width"] and image_height <= ip.size["height"]:
-            return image_height, image_width
-
-        height_scale_factor = ip.size["height"] / image_height
-        width_scale_factor = ip.size["width"] / image_width
-        optimal_scale_factor = min(height_scale_factor, width_scale_factor)
-
-        new_height = int(image_height * optimal_scale_factor)
-        new_width = int(image_width * optimal_scale_factor)
-        return new_height, new_width
-
+    # not really ai2d specific... to move
     def estimate_input_size(self, idx):
         q = self.questions[idx]
         w, h = Image.open(q.image_path).size
@@ -154,8 +135,8 @@ class AI2DMultipleChoiceDataset(Dataset):
         target = self.processor.tokenizer.encode(
             q.answers[q.correct_answer], add_special_tokens=False
         )
-        padded_h, padded_w = self.pad(
-            *self.scale(h, w),
+        padded_h, padded_w = fuyu_data.get_padding_dims(
+            *fuyu_data.get_scale_dims(h, w),
         )
         new_h = min(padded_h, math.ceil(h / patch_h) * patch_h)
         new_w = min(padded_w, math.ceil(w / patch_w) * patch_w)
@@ -165,7 +146,7 @@ class AI2DMultipleChoiceDataset(Dataset):
         return len(input) + len(target) + 2 + new_h // patch_h + num_patches
 
 
-class AI2DDatasetForAutoEval(Dataset):
+class AI2DMultipleAnswerDataset(Dataset):
     def __init__(
         self,
         questions: List[MultipleChoiceQuestion],
@@ -196,60 +177,13 @@ class AI2DDatasetForAutoEval(Dataset):
         }
 
 
-@dataclass
-class FuyuCollator(object):
-    processor: FuyuProcessor
-    train_on_inputs: bool
-
-    def __call__(self, instances):
-        images = [instance["image"] for instance in instances]
-        texts = [
-            instance["text"]
-            + BEGINNING_OF_ANSWER_STRING
-            + instance["target"]
-            + self.processor.tokenizer.eos_token
-            for instance in instances
-        ]
-        collated = self.processor(images=images, text=texts)
-        batch_size = collated["input_ids"].shape[0]
-
-        labels = copy.deepcopy(collated["input_ids"])
-        labels = torch.where(collated["attention_mask"].bool(), labels, -100)
-        for i in range(batch_size):
-            target_size = (
-                len(
-                    self.processor.tokenizer(
-                        instances[i]["target"], add_special_tokens=False
-                    )
-                )
-                + 2
-            )
-            if self.train_on_inputs:
-                target_size += (
-                    len(
-                        self.processor.tokenizer(
-                            instances[i]["text"], add_special_tokens=False
-                        )
-                    )
-                    + 1
-                )
-            labels[i, :-target_size] = -100
-
-        collated["labels"] = labels
-        if "is_correct" in instances[0]:
-            collated["is_correct"] = torch.tensor(
-                [instance["is_correct"] for instance in instances]
-            )
-            collated["question_id"] = torch.tensor(
-                [instance["question_id"] for instance in instances], dtype=torch.long
-            )
-        return collated
 
 
 def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
-    # Cache vocab for performance
+    # Cache vocab to fix performance issues.
     vocab = tokenizer.get_vocab()
     tokenizer.get_vocab = lambda: vocab
+
     processor = FuyuProcessor(
         image_processor=FuyuImageProcessor(),
         tokenizer=tokenizer,
@@ -270,11 +204,10 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         print(
             f"There are {len(train_questions)} training questions and {len(test_questions)} test questions."
         )
-
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
-    dataset_for_auto_eval = AI2DDatasetForAutoEval(test_questions, processor)
-    dataset_for_greedy_eval = AI2DMultipleChoiceDataset(test_questions, processor)
-    data_collator = FuyuCollator(
+    val_dataset = AI2DMultipleChoiceDataset(test_questions, processor)
+    dataset_for_multiple_choice = AI2DMultipleAnswerDataset(test_questions, processor)
+    data_collator = fuyu_data.FuyuCollator(
         processor, train_on_inputs=config.train_on_questions
     )
     if config.use_packed_sampler:
@@ -296,7 +229,6 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
             batch_sampler=batch_sampler,
             num_workers=4,
         )
-        print("loading packed sampler--getting max_train_steps")
         max_train_steps = torch.tensor(len(train_dataloader)).long().to(local_rank)
         dist.all_reduce(max_train_steps, op=dist.ReduceOp.MIN)
         max_train_steps = max_train_steps.cpu().item()
@@ -318,44 +250,44 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         )
         max_train_steps = len(train_dataloader)
 
-    auto_eval_sampler = DistributedSampler(
-        dataset_for_auto_eval,
+    multiple_choice_sampler = DistributedSampler(
+        dataset_for_multiple_choice,
         num_replicas=world_size,
         rank=local_rank,
         shuffle=False,
         seed=config.seed,
     )
 
-    auto_eval_dataloader = DataLoader(
-        dataset_for_auto_eval,
+    multiple_choice_dataloader = DataLoader(
+        dataset_for_multiple_choice,
         batch_size=config.eval_batch_size,
-        collate_fn=FuyuCollator(processor, False),
+        collate_fn=fuyu_data.FuyuCollator(processor, False),
         pin_memory=True,
-        sampler=auto_eval_sampler,
+        sampler=multiple_choice_sampler,
         worker_init_fn=utils.seed_worker,
     )
 
-    greedy_eval_sampler = DistributedSampler(
-        dataset_for_greedy_eval,
+    val_sampler = DistributedSampler(
+        val_dataset,
         num_replicas=world_size,
         rank=local_rank,
         shuffle=False,
         seed=config.seed,
     )
-    greedy_eval_dataloader = DataLoader(
-        dataset_for_greedy_eval,
+    val_dataloader = DataLoader(
+        val_dataset,
         batch_size=config.eval_batch_size,
-        collate_fn=FuyuCollator(processor, False),
+        collate_fn=fuyu_data.FuyuCollator(processor, False),
         pin_memory=True,
-        sampler=greedy_eval_sampler,
+        sampler=val_sampler,
         worker_init_fn=utils.seed_worker,
     )
 
     return (
         train_dataloader,
-        auto_eval_dataloader,
         max_train_steps,
-        greedy_eval_dataloader,
+        val_dataloader,
+        multiple_choice_dataloader,
     )
 
 

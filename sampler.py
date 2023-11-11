@@ -6,6 +6,9 @@ from torch.utils.data import Sampler
 
 
 class PackedDistributedBatchSampler(Sampler):
+    # experimental and probably a bad idea. Packs sequences of similar length together
+    # to increase throughput, but may affect sample efficiency negatively and breaks
+    # IID assumptions
     def __init__(
         self,
         batch_max_length: int,

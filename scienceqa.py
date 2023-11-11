@@ -37,11 +37,9 @@ class ScienceQADataset(Dataset):
             "target": question['choices'][question['answer']],
         }
 
-class ScienceQADatasetForAutoEval(Dataset):
-    pass
 
 def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
-    # Cache vocab for performance
+    # TODO: put this back. Getting issues with pikcling in dataloader.
     #vocab = tokenizer.get_vocab()
     
     #def get_vocab():
