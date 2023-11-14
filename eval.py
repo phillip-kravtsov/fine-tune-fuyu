@@ -278,15 +278,15 @@ def eval(model, dataloader: DataLoader, rank: int, world_size: int):
                 except torch.cuda.OutOfMemoryError as e:
                     print("Cuda OOM on input with shape", batch["input_ids"].shape)
                     raise e
-
             labels = batch["labels"].to(rank)
+            if isinstance(outputs, tuple):
+                outputs, patch_predictions = outputs
+                patch_loss = model.get_patch_prediction_loss(batch, patch_predictions)
+                loss_lists['patch_loss'].append(patch_loss.view(1))
             logits = outputs.logits.float()
             correct_tensors.append(are_labels_most_likely(logits, labels))
             nll_loss = outputs.loss
             loss_lists['nll_loss'].append(nll_loss.view(1))
-            if 'patch_predictions' in outputs:
-                patch_loss = model.get_patch_prediction_loss(batch, outputs)
-                loss_lists['patch_loss'].append(patch_loss.view(1))
 
     loss_tensors = OrderedDict()
     for k in sorted(loss_lists.keys()):

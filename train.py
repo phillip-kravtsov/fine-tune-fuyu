@@ -87,7 +87,7 @@ def load_model(config: TrainingConfig, device_map=None):
     tokenizer.get_vocab = lambda: vocab
 
     if device_map is None:
-        device_map = f"cuda:{0}" if config.lora else None
+        device_map = f"cuda:{0}" if config.lora else f"cuda:{torch.cuda.current_device()}"
     if config.patch_prediction:
         print("Loading patch prediction model")
         model = fuyu.FuyuWithPatchPrediction.from_pretrained(
@@ -97,6 +97,7 @@ def load_model(config: TrainingConfig, device_map=None):
             device_map=device_map,
         )
     else:
+        print("loading non-patch causal lm")
         model = transformers.FuyuForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
@@ -126,15 +127,16 @@ def load_model(config: TrainingConfig, device_map=None):
             transformer_auto_wrap_policy,
             transformer_layer_cls={
                 FuyuVisionEmbedTokens,
-                PersimmonLMHead,
                 PersimmonEmbedTokens,
                 PersimmonDecoderLayer,
+                PersimmonLMHead,
+                fuyu.PatchPrediction,
             },
         )
         model = FSDP(
             model,
             limit_all_gathers=True,
-            cpu_offload=CPUOffload(False),
+            cpu_offload=CPUOffload(True),
             backward_prefetch=None,
             param_init_fn=None,
             auto_wrap_policy=auto_wrap_policy,
@@ -303,11 +305,13 @@ class Trainer:
         try:
             with forward_context:
                 outputs = model(**batch)
-            nll_loss = outputs.loss
             if self.config.patch_prediction:
-                patch_loss = model.get_patch_prediction_loss(batch, outputs)
+                outputs, patch_predictions = outputs
+                nll_loss = outputs.loss
+                patch_loss = model.get_patch_prediction_loss(batch, patch_predictions)
                 loss = nll_loss + self.config.alpha * patch_loss
             else:
+                nll_loss = outputs.loss
                 loss = nll_loss
             loss.backward()
 
@@ -425,6 +429,8 @@ def main():
     print("Initializing process group")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     model, tokenizer = load_model(config)
+    if local_rank == 0:
+        print(model)
     if config.dataset == "ai2d":
         (
             train_dataloader,

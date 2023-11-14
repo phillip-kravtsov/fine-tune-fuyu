@@ -1,10 +1,12 @@
 from typing import Optional, List
-from transformers import FuyuForCausalLM, FuyuConfig, AutoModelForCausalLM
+from transformers import FuyuPreTrainedModel, FuyuConfig, AutoModelForCausalLM
 from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
 import torch
 
+class PatchPrediction(torch.nn.Linear):
+    pass
 
-class FuyuWithPatchPrediction(FuyuForCausalLM):
+class FuyuWithPatchPrediction(FuyuPreTrainedModel):
     def __init__(self, config: FuyuConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -19,7 +21,7 @@ class FuyuWithPatchPrediction(FuyuForCausalLM):
             config.hidden_size,
         )
 
-        self.next_patch_predictor = torch.nn.Linear(
+        self.next_patch_predictor = PatchPrediction(
             config.hidden_size,
             config.patch_size * config.patch_size * config.num_channels,
         )
@@ -29,6 +31,52 @@ class FuyuWithPatchPrediction(FuyuForCausalLM):
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
+
+    def get_output_embeddings(self):
+        return self.language_model.get_output_embeddings()
+
+    def set_input_embeddings(self, value):
+        self.language_model.set_input_embeddings(value)
+
+    def gather_continuous_embeddings(
+        self,
+        word_embeddings: torch.Tensor,
+        continuous_embeddings: List[torch.Tensor],
+        image_patch_input_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """This function places the continuous_embeddings into the word_embeddings at the locations
+        indicated by image_patch_input_indices. Different batch elements can have different numbers of continuous
+        embeddings.
+
+        Args:
+            word_embeddings: Tensor of word embeddings. Shape: [b, s, h]
+            continuous_embeddings:
+                Tensor of continuous embeddings. The length of the list is the batch size. Each entry is
+            shape [num_image_embeddings, hidden], and num_image_embeddings needs to match the number of non-negative
+            indices in image_patch_input_indices for that batch element.
+            image_patch_input_indices: Tensor of indices of the image patches in the input_ids tensor. Shape: [b, s]
+        """
+        if not (word_embeddings.shape[0] == len(continuous_embeddings)):
+            raise ValueError(
+                f"Batch sizes must match! Got {len(continuous_embeddings)=} and {word_embeddings.shape[0]=}"
+            )
+
+        output_embeddings = word_embeddings.clone()
+        for batch_idx in range(word_embeddings.shape[0]):
+            # First, find the positions of all the non-negative values in image_patch_input_indices, those are the
+            # positions in word_embeddings that we want to replace with content from continuous_embeddings.
+            dst_indices = torch.nonzero(image_patch_input_indices[batch_idx] >= 0, as_tuple=True)[0]
+            # Next look up those indices in image_patch_input_indices to find the indices in continuous_embeddings that we
+            # want to use to replace the values in word_embeddings.
+            src_indices = image_patch_input_indices[batch_idx][dst_indices]
+            # Check if we have more indices than embeddings. Note that we could have fewer indices if images got truncated.
+            if src_indices.shape[0] > continuous_embeddings[batch_idx].shape[0]:
+                raise ValueError(
+                    f"Number of continuous embeddings {continuous_embeddings[batch_idx].shape=} does not match "
+                    f"number of continuous token ids {src_indices.shape=} in batch element {batch_idx}."
+                )
+            output_embeddings[batch_idx, dst_indices] = continuous_embeddings[batch_idx][src_indices]
+        return output_embeddings
 
     def forward(
         self,
@@ -122,14 +170,14 @@ class FuyuWithPatchPrediction(FuyuForCausalLM):
 
         hidden_states = outputs.hidden_states[-1]
         patch_predictions = self.next_patch_predictor(hidden_states)
-        outputs["patch_predictions"] = patch_predictions
-        return outputs
+        return outputs, patch_predictions
 
-    def get_patch_prediction_loss(self, batch, outputs):
-        # this is deceptively simple. > 0 makes sure that we skip the first element of the sequence
-        # >= 0 includes all elements. This is like shifting labels in causal language modeling but
+    def get_patch_prediction_loss(self, batch, patch_predictions):
+        # > 0 makes sure that we skip the first element of the sequence
+        # (note that >= 0 includes all elements)
+        # This is like shifting labels in causal language modeling but
         # accounts for batching correctly
-        patch_predictions = outputs.patch_predictions[
+        patch_predictions = patch_predictions[
             batch["image_patches_indices"] > 0
         ]
         targets = torch.concat(
