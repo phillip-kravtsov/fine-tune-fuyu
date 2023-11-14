@@ -1,11 +1,12 @@
 from dataclasses import dataclass, field, fields
-from typing import Optional, Union, get_args, get_origin, List
+from typing import List, Optional, Union, get_args, get_origin
 
 
 @dataclass
 class ModelConfig(object):
     model_name_or_path: str = field(default="adept/fuyu-8b")
     fsdp: bool = field(default=False)
+    ddp: bool = field(default=False)
     lora: bool = field(default=False)
     lora_r: int = field(default=32)
     lora_alpha: int = field(default=32)

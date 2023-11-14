@@ -24,6 +24,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as FSDP,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.profiler import profile
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -34,10 +35,10 @@ from transformers.models.persimmon.modeling_persimmon import (
     PersimmonEmbedTokens,
     PersimmonLMHead,
 )
-import fuyu
 
 import ai2d
 import eval
+import fuyu
 import lora
 import scienceqa
 import utils
@@ -70,14 +71,16 @@ def save_fsdp_model(step, model, tokenizer, local_rank):
 
 
 def save_model(step, model, tokenizer, is_lora, local_rank):
-    return (
+    if local_rank == 0 and is_lora:
         lora.save_lora_model(step, model, tokenizer)
-        if is_lora
-        else save_fsdp_model(step, model, tokenizer, local_rank)
-    )
+    if isinstance(model, FSDP):
+        save_fsdp_model(step, model, tokenizer, local_rank)
+    if isinstance(model, DDP) and local_rank == 0:
+        model_path = os.path.join(get_checkpoint_dir(step), "pytorch_model.bin")
+        torch.save(model.state_dict(), model_path)
 
 
-def load_model(config: TrainingConfig, device_map=None):
+def load_model(config: TrainingConfig, device_map=None, local_rank=None):
     model_path = config.model_name_or_path
     if config.run_name is not None:
         model_path = utils.get_latest_checkpoint_dir(config.run_name)
@@ -87,7 +90,7 @@ def load_model(config: TrainingConfig, device_map=None):
     tokenizer.get_vocab = lambda: vocab
 
     if device_map is None:
-        device_map = f"cuda:{0}" if config.lora else f"cuda:{torch.cuda.current_device()}"
+        device_map = f"cuda:{torch.cuda.current_device()}"
     if config.patch_prediction:
         print("Loading patch prediction model")
         model = fuyu.FuyuWithPatchPrediction.from_pretrained(
@@ -148,6 +151,8 @@ def load_model(config: TrainingConfig, device_map=None):
                 buffer_dtype=torch.bfloat16,
             ),
         )
+    elif config.ddp:
+        model = DDP(model, device_ids=[local_rank])
     return model, tokenizer
 
 
@@ -308,7 +313,9 @@ class Trainer:
             if self.config.patch_prediction:
                 outputs, patch_predictions = outputs
                 nll_loss = outputs.loss
-                patch_loss = model.get_patch_prediction_loss(batch, patch_predictions)
+                patch_loss = fuyu.FuyuWithPatchPrediction.get_patch_prediction_loss(
+                    batch, patch_predictions
+                )
                 loss = nll_loss + self.config.alpha * patch_loss
             else:
                 nll_loss = outputs.loss
@@ -426,9 +433,9 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.cuda.set_device(local_rank)
-    print("Initializing process group")
+    print(f"Initializing process group {local_rank}")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-    model, tokenizer = load_model(config)
+    model, tokenizer = load_model(config, device_map=None, local_rank=local_rank)
     if local_rank == 0:
         print(model)
     if config.dataset == "ai2d":

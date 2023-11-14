@@ -1,8 +1,8 @@
 import cProfile
 import gc
+import glob
 import json
 import os
-import glob
 import random
 from dataclasses import asdict
 

@@ -1,10 +1,13 @@
-from typing import Optional, List
-from transformers import FuyuPreTrainedModel, FuyuConfig, AutoModelForCausalLM
-from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
+from typing import List, Optional
+
 import torch
+from transformers import AutoModelForCausalLM, FuyuConfig, FuyuPreTrainedModel
+from transformers.models.fuyu.modeling_fuyu import FuyuVisionEmbedTokens
+
 
 class PatchPrediction(torch.nn.Linear):
     pass
+
 
 class FuyuWithPatchPrediction(FuyuPreTrainedModel):
     def __init__(self, config: FuyuConfig):
@@ -65,7 +68,9 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
         for batch_idx in range(word_embeddings.shape[0]):
             # First, find the positions of all the non-negative values in image_patch_input_indices, those are the
             # positions in word_embeddings that we want to replace with content from continuous_embeddings.
-            dst_indices = torch.nonzero(image_patch_input_indices[batch_idx] >= 0, as_tuple=True)[0]
+            dst_indices = torch.nonzero(
+                image_patch_input_indices[batch_idx] >= 0, as_tuple=True
+            )[0]
             # Next look up those indices in image_patch_input_indices to find the indices in continuous_embeddings that we
             # want to use to replace the values in word_embeddings.
             src_indices = image_patch_input_indices[batch_idx][dst_indices]
@@ -75,7 +80,9 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
                     f"Number of continuous embeddings {continuous_embeddings[batch_idx].shape=} does not match "
                     f"number of continuous token ids {src_indices.shape=} in batch element {batch_idx}."
                 )
-            output_embeddings[batch_idx, dst_indices] = continuous_embeddings[batch_idx][src_indices]
+            output_embeddings[batch_idx, dst_indices] = continuous_embeddings[
+                batch_idx
+            ][src_indices]
         return output_embeddings
 
     def forward(
@@ -172,24 +179,17 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
         patch_predictions = self.next_patch_predictor(hidden_states)
         return outputs, patch_predictions
 
-    def get_patch_prediction_loss(self, batch, patch_predictions):
+    @staticmethod
+    def get_patch_prediction_loss(batch, patch_predictions):
         # > 0 makes sure that we skip the first element of the sequence
         # (note that >= 0 includes all elements)
         # This is like shifting labels in causal language modeling but
         # accounts for batching correctly
-        patch_predictions = patch_predictions[
-            batch["image_patches_indices"] > 0
-        ]
+        patch_predictions = patch_predictions[batch["image_patches_indices"] > 0]
         targets = torch.concat(
-            [
-                image_patches[:, 1:, :]
-                for image_patches in batch["image_patches"]
-            ],
+            [image_patches[:, 1:, :] for image_patches in batch["image_patches"]],
             dim=1,
         ).squeeze()
         criterion = torch.nn.MSELoss()
-        mse_loss = criterion(
-            patch_predictions, targets.to(patch_predictions.dtype)
-        )
+        mse_loss = criterion(patch_predictions, targets.to(patch_predictions.dtype))
         return mse_loss
-

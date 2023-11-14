@@ -11,10 +11,12 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=4 --rdzv-bac
   --weight_decay 0.0 \
   --use_flash_attn \
   --dataset ai2d \
-  --fsdp \
+  --lora \
   --gradient_checkpointing \
   --max_eval_ids 20 \
   --model_name_or_path "fuyu-8b-slim-vocab" \
-#  --patch_prediction \
+  --patch_prediction \
+#  --ddp \
+#  --fsdp \
 #  --profile \
 #  --use_packed_sampler \
