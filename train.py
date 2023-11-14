@@ -41,6 +41,7 @@ import eval
 import fuyu
 import lora
 import scienceqa
+import textvqa
 import utils
 import wandb
 from config import TrainingConfig, parse_training_args
@@ -462,6 +463,14 @@ def main():
             local_rank=local_rank,
             world_size=world_size,
         )
+    elif config.dataset == "textvqa":
+        train_dataloader, max_train_steps, val_dataloader = textvqa.get_data(
+            config,
+            tokenizer=tokenizer,
+            local_rank=local_rank,
+            world_size=world_size,
+        )
+        multiple_choice_dataloader = None
     else:
         raise ValueError(f"Unknown dataset {config.dataset}")
 
