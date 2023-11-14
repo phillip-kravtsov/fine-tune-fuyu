@@ -34,6 +34,7 @@ from transformers.models.persimmon.modeling_persimmon import (
     PersimmonEmbedTokens,
     PersimmonLMHead,
 )
+import fuyu
 
 import ai2d
 import eval
@@ -41,7 +42,7 @@ import lora
 import scienceqa
 import utils
 import wandb
-from config import Config, parse_args
+from config import TrainingConfig, parse_training_args
 from utils import get_checkpoint_dir, get_run_dir
 
 OUTPUT_DIR = "/workspace/fuyu/output"
@@ -76,22 +77,10 @@ def save_model(step, model, tokenizer, is_lora, local_rank):
     )
 
 
-def get_latest_checkpoint_dir(run_name: str) -> str:
-    run_dir = get_run_dir(run_name)
-    paths = glob.glob(os.path.join(run_dir, "step-*"))
-    steps = [p.split("-")[-1] for p in paths]
-    if "final" in steps:
-        checkpoint_dir = os.path.join(run_dir, "step-final")
-    else:
-        step = max([int(s) for s in steps])
-        checkpoint_dir = os.path.join(run_dir, f"step-{step}")
-    return checkpoint_dir
-
-
-def load_model(config: Config, device_map=None):
+def load_model(config: TrainingConfig, device_map=None):
     model_path = config.model_name_or_path
     if config.run_name is not None:
-        model_path = get_latest_checkpoint_dir(config.run_name)
+        model_path = utils.get_latest_checkpoint_dir(config.run_name)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
     vocab = tokenizer.get_vocab()
@@ -99,12 +88,21 @@ def load_model(config: Config, device_map=None):
 
     if device_map is None:
         device_map = f"cuda:{0}" if config.lora else None
-    model = transformers.FuyuForCausalLM.from_pretrained(
-        config.model_name_or_path,
-        torch_dtype=torch.bfloat16,
-        use_flash_attention_2=config.use_flash_attn,
-        device_map=device_map,
-    )
+    if config.patch_prediction:
+        print("Loading patch prediction model")
+        model = fuyu.FuyuWithPatchPrediction.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            use_flash_attention_2=config.use_flash_attn,
+            device_map=device_map,
+        )
+    else:
+        model = transformers.FuyuForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            use_flash_attention_2=config.use_flash_attn,
+            device_map=device_map,
+        )
 
     # Avoid conflicts with gradient checkpointing.
     if config.gradient_checkpointing:
@@ -151,13 +149,13 @@ def load_model(config: Config, device_map=None):
     return model, tokenizer
 
 
-def load_config(run_name: str) -> Config:
+def load_config(run_name: str) -> TrainingConfig:
     with open(f"{OUTPUT_DIR}/{run_name}/config.json", "r") as f:
         config = json.loads(f.read())
-    return Config(**config)
+    return TrainingConfig(**config)
 
 
-def save_config(config: Config, run_name: str):
+def save_config(config: TrainingConfig, run_name: str):
     run_dir = get_run_dir(run_name)
     if not os.path.exists(run_dir):
         os.makedirs(run_dir)
@@ -178,7 +176,7 @@ def get_parameter_names(model, forbidden_layer_types):
     return result
 
 
-def get_optimizer(model, max_train_steps: int, config: Config):
+def get_optimizer(model, max_train_steps: int, config: TrainingConfig):
     decay_parameters = get_parameter_names(model, [torch.nn.LayerNorm])
     decay_parameters = [name for name in decay_parameters if "bias" not in name]
     optimizer_grouped_parameters = [
@@ -200,7 +198,13 @@ def get_optimizer(model, max_train_steps: int, config: Config):
         },
     ]
     if config.lora:
-        opt_params = [p for n, p in model.named_parameters() if "lora" in n]
+        opt_params = {
+            n: p
+            for n, p in model.named_parameters()
+            if "lora" in n or "next_patch_predictor" in n
+        }
+        print(opt_params.keys())
+        opt_params = opt_params.values()
     else:
         opt_params = optimizer_grouped_parameters
     utils.print_trainable_parameters(model)
@@ -227,9 +231,9 @@ class Trainer:
         optimizer,
         lr_scheduler,
         train_dataloader: DataLoader,
-        eval_dataloader: Optional[DataLoader],
-        greedy_eval_dataloader: DataLoader,
-        config: Config,
+        val_dataloader: Optional[DataLoader],
+        multiple_choice_dataloader: DataLoader,
+        config: TrainingConfig,
         local_rank: int,
         world_size: int,
         max_train_steps: Optional[int] = None,
@@ -240,8 +244,8 @@ class Trainer:
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.train_dataloader = train_dataloader
-        self.eval_dataloader = eval_dataloader
-        self.greedy_eval_dataloader = greedy_eval_dataloader
+        self.val_dataloader = val_dataloader
+        self.multiple_choice_dataloader = multiple_choice_dataloader
         self.config = config
         self.local_rank = local_rank
         self.world_size = world_size
@@ -251,7 +255,9 @@ class Trainer:
 
     def _init_tracking(self):
         if self.local_rank == 0:
-            wandb.init(project=f"fuyu-{self.config.dataset}", config=self.config.__dict__)
+            wandb.init(
+                project=f"fuyu-{self.config.dataset}", config=self.config.__dict__
+            )
             if wandb.run is None:
                 raise Exception
             save_config(self.config, wandb.run.name)
@@ -290,15 +296,35 @@ class Trainer:
     def step(self, batch):
         model, optimizer, lr_scheduler = self.model, self.optimizer, self.lr_scheduler
         model.train()
-        batch = utils.prepare_inputs(
-            batch, f"cuda:{torch.cuda.current_device()}", fdtype=torch.bfloat16
-        )
         forward_context = (
             torch.autocast("cuda") if not isinstance(model, FSDP) else nullcontext()
         )
+        batch = batch.to(self.local_rank, torch.bfloat16)
         try:
             with forward_context:
-                loss = model(**batch).loss
+                outputs = model(**batch)
+            nll_loss = outputs.loss
+            if self.config.patch_prediction:
+                # this is deceptively simple. > 0 makes sure that we skip the first element of the sequence
+                # >= 0 includes all elements. This is like shifting labels in causal language modeling but
+                # accounts for batching correctly
+                patch_predictions = outputs.patch_predictions[
+                    batch["image_patches_indices"] > 0
+                ]
+                targets = torch.concat(
+                    [
+                        image_patches[:, 1:, :]
+                        for image_patches in batch["image_patches"]
+                    ],
+                    dim=1,
+                ).squeeze()
+                mse_loss = torch.nn.MSELoss()
+                mse_loss_value = mse_loss(
+                    patch_predictions, targets.to(patch_predictions.dtype)
+                )
+                loss = nll_loss + self.config.alpha * mse_loss_value
+            else:
+                loss = nll_loss
             loss.backward()
             if hasattr(model, "clip_grad_norm_"):
                 model.clip_grad_norm_(1.0)
@@ -312,10 +338,18 @@ class Trainer:
             raise e
         loss = loss.detach()
         loss = utils.get_all_reduce_mean(loss).item()
+        to_log = {"loss/train": nll_loss}
+        if self.config.patch_prediction:
+            to_log["mse_loss/train"] = utils.get_all_reduce_mean(
+                mse_loss_value.detach()
+            ).item()
+            to_log["nll_loss/train"] = utils.get_all_reduce_mean(
+                nll_loss.detach()
+            ).item()
         self.completed_steps += 1
         if self.local_rank == 0:
             if wandb.run is not None:
-                wandb.log({"loss/train": loss}, step=self.completed_steps)
+                wandb.log(to_log, step=self.completed_steps)
 
     def save_model(self, step=None):
         if step is None:
@@ -362,32 +396,41 @@ class Trainer:
 
     def eval(self, suffix: str) -> Dict[str, Any]:
         to_log = {}
-        if self.greedy_eval_dataloader is not None:
+        if self.multiple_choice_dataloader is not None:
+            strict_accuracy = eval.likelihood_eval_v2(
+                self.model,
+                self.multiple_choice_dataloader,
+                self.local_rank,
+                self.world_size,
+            )
+            to_log[f"likelihood_accuracy/{suffix}"] = strict_accuracy
+
+        if self.val_dataloader is not None:
+            """
+            accuracy, loss = eval.likelihood_eval(
+                self.model,
+                self.val_dataloader,
+                self.local_rank,
+                self.world_size,
+            )
+            """
             strict_accuracy, loss = eval.greedy_eval(
                 self.model,
-                self.greedy_eval_dataloader,
+                self.val_dataloader,
                 self.local_rank,
                 self.world_size,
             )
             to_log[f"strict_accuracy/{suffix}"] = strict_accuracy
             to_log[f"loss/{suffix}"] = loss
-
-        if self.eval_dataloader is not None:
-            accuracy, loss = eval.likelihood_eval(
-                self.model,
-                self.eval_dataloader,
-                self.local_rank,
-                self.world_size,
-            )
-            to_log[f"accuracy/{suffix}"] = accuracy
-            to_log[f"loss-auto/{suffix}"] = loss
+            # to_log[f"accuracy/{suffix}"] = accuracy
+            # to_log[f"loss-auto/{suffix}"] = loss
         return to_log
 
 
 def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     parser = argparse.ArgumentParser(description="Fine-tune Fuyu models.")
-    config = parse_args(parser)
+    config = parse_training_args(parser)
     if config.run_name is not None:
         print(f"Loading config from {config.run_name}")
         config = load_config(config.run_name)
@@ -411,26 +454,26 @@ def main():
     if config.dataset == "ai2d":
         (
             train_dataloader,
-            eval_dataloader,
             max_train_steps,
-            greedy_eval_dataloader,
+            val_dataloader,
+            multiple_choice_dataloader,
         ) = ai2d.get_data(
             config,
-            world_size=world_size,
-            local_rank=local_rank,
             tokenizer=tokenizer,
+            local_rank=local_rank,
+            world_size=world_size,
         )
     elif config.dataset == "scienceqa":
         (
             train_dataloader,
-            eval_dataloader,
             max_train_steps,
-            greedy_eval_dataloader,
+            val_dataloader,
+            multiple_choice_dataloader,
         ) = scienceqa.get_data(
             config,
-            world_size=world_size,
-            local_rank=local_rank,
             tokenizer=tokenizer,
+            local_rank=local_rank,
+            world_size=world_size,
         )
     else:
         raise ValueError(f"Unknown dataset {config.dataset}")
@@ -444,8 +487,8 @@ def main():
         local_rank=local_rank,
         world_size=world_size,
         train_dataloader=train_dataloader,
-        eval_dataloader=eval_dataloader,
-        greedy_eval_dataloader=greedy_eval_dataloader,
+        val_dataloader=val_dataloader,
+        multiple_choice_dataloader=multiple_choice_dataloader,
         config=config,
     )
     trainer.train()

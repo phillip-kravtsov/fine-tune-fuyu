@@ -16,7 +16,7 @@ from transformers import FuyuImageProcessor, FuyuProcessor
 
 import data as fuyu_data
 import utils
-from config import Config
+from config import TrainingConfig
 from sampler import PackedDistributedBatchSampler
 
 AI2D_DATA_DIR = "/workspace/ai2d"
@@ -41,7 +41,7 @@ def get_image_id(question: MultipleChoiceQuestion):
     return question.image_path.split("/")[-1].split(".")[0]
 
 
-def get_ai2d_questions(root_dir: str, skip_abc=False) -> List[MultipleChoiceQuestion]:
+def get_ai2d_questions(root_dir: str) -> List[MultipleChoiceQuestion]:
     questions_dir = os.path.join(root_dir, "questions")
     per_image_data = []
     for path in sorted(os.listdir(questions_dir)):
@@ -58,8 +58,6 @@ def get_ai2d_questions(root_dir: str, skip_abc=False) -> List[MultipleChoiceQues
         )
         for question_text, question_data in image_data["questions"].items():
             is_abc = question_data["abcLabel"]
-            if skip_abc and is_abc:
-                continue
             question_id = get_int_question_id(question_data["questionId"])
             questions.append(
                 MultipleChoiceQuestion(
@@ -122,8 +120,6 @@ class AI2DMultipleChoiceDataset(Dataset):
             "image": image,
             "text": get_input_text(q),
             "target": q.answers[q.correct_answer],
-            "is_correct": True,
-            "question_id": q.question_id,
         }
 
     # not really ai2d specific... to move
@@ -137,7 +133,7 @@ class AI2DMultipleChoiceDataset(Dataset):
         )
         padded_h, padded_w = fuyu_data.get_padding_dims(
             *fuyu_data.get_scale_dims(h, w, self.processor.image_processor),
-            self.processor.image_processor
+            self.processor.image_processor,
         )
         new_h = min(padded_h, math.ceil(h / patch_h) * patch_h)
         new_w = min(padded_w, math.ceil(w / patch_w) * patch_w)
@@ -147,15 +143,35 @@ class AI2DMultipleChoiceDataset(Dataset):
         return len(input) + len(target) + 2 + new_h // patch_h + num_patches
 
 
+class MultipleAnswerAI2DDataset(Dataset):
+    def __init__(
+        self,
+        questions: List[MultipleChoiceQuestion],
+    ):
+        self.questions = questions
+
+    def __len__(self):
+        return len(self.questions)
+
+    def __getitem__(self, idx: int):
+        question = self.questions[idx]
+        image = Image.open(question.image_path).convert("RGB")
+        return {
+            "image": image,
+            "text": get_input_text(question),
+            "answers": question.answers,
+            "correctAnswer": question.correct_answer,
+        }
+
+
+"""
 class AI2DMultipleAnswerDataset(Dataset):
     def __init__(
         self,
         questions: List[MultipleChoiceQuestion],
-        processor: FuyuProcessor,
         include_labels=True,
     ):
         self.include_labels = include_labels
-        self.processor = processor
         self.questions: List[MultipleChoiceQuestion] = questions
         self.length = sum([len(q.answers) for q in self.questions])
         self.answer_idx_to_question_idx = [
@@ -176,13 +192,10 @@ class AI2DMultipleAnswerDataset(Dataset):
             "is_correct": answer_idx == q.correct_answer,
             "question_id": q.question_id,
         }
+"""
 
 
-def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
-    # Cache vocab to fix performance issues.
-    vocab = tokenizer.get_vocab()
-    tokenizer.get_vocab = lambda: vocab
-
+def get_data(config: TrainingConfig, world_size: int, local_rank: int, tokenizer):
     processor = FuyuProcessor(
         image_processor=FuyuImageProcessor(),
         tokenizer=tokenizer,
@@ -196,7 +209,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         test_ids = test_ids[: config.max_eval_ids]
     test_ids = set(test_ids)
 
-    all_questions = get_ai2d_questions(AI2D_DATA_DIR, skip_abc=config.skip_abc)
+    all_questions = get_ai2d_questions(AI2D_DATA_DIR)
     test_questions = [q for q in all_questions if get_image_id(q) in test_ids]
     train_questions = [q for q in all_questions if get_image_id(q) not in test_ids]
     if local_rank == 0:
@@ -205,7 +218,7 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         )
     train_dataset = AI2DMultipleChoiceDataset(train_questions, processor)
     val_dataset = AI2DMultipleChoiceDataset(test_questions, processor)
-    multiple_answer_dataset = AI2DMultipleAnswerDataset(test_questions, processor)
+    multiple_answer_dataset = MultipleAnswerAI2DDataset(test_questions)
     data_collator = fuyu_data.FuyuCollator(
         processor, train_on_inputs=config.train_on_questions
     )
@@ -256,11 +269,10 @@ def get_data(config: Config, world_size: int, local_rank: int, tokenizer):
         shuffle=False,
         seed=config.seed,
     )
-
     multiple_choice_dataloader = DataLoader(
         multiple_answer_dataset,
-        batch_size=config.eval_batch_size,
-        collate_fn=fuyu_data.FuyuCollator(processor, False),
+        batch_size=1,
+        collate_fn=fuyu_data.FuyuMultiAnswerCollator(processor),
         pin_memory=True,
         sampler=multiple_choice_sampler,
         worker_init_fn=utils.seed_worker,
@@ -321,7 +333,7 @@ def replace_text_and_save(base_path, question: MultipleChoiceQuestion):
 
 
 def create_overlay_images():
-    questions = get_ai2d_questions(AI2D_DATA_DIR, False)
+    questions = get_ai2d_questions(AI2D_DATA_DIR)
     for question in tqdm(questions):
         replace_text_and_save(AI2D_DATA_DIR, question)
 

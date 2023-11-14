@@ -3,6 +3,7 @@ import os
 import eval
 import torch
 
+
 class TestEval(unittest.TestCase):
     def setUp(self) -> None:
         return super().setUp()
@@ -10,10 +11,12 @@ class TestEval(unittest.TestCase):
     def test_get_label_log_probs(self):
         b, s, v = 2, 3, 4
         logits = torch.randn(b, s, v)
-        labels = torch.tensor([
-            [-100, 2,    3],
-            [1   , -100, 0],
-        ])
+        labels = torch.tensor(
+            [
+                [-100, 2, 3],
+                [1, -100, 0],
+            ]
+        )
         expected = torch.zeros(b)
         log_probs = torch.log_softmax(logits, dim=-1)
         for batch_idx in range(b):
@@ -26,7 +29,7 @@ class TestEval(unittest.TestCase):
                     continue
                 log_prob = batch_log_probs[seq_idx][label]
                 mean_log_probs += log_prob
-            expected[batch_idx] = mean_log_probs 
+            expected[batch_idx] = mean_log_probs
         actual = eval.get_label_log_probs(logits, labels)
         if not torch.allclose(expected, actual):
             print(expected)
@@ -55,6 +58,3 @@ class TestEval(unittest.TestCase):
                     break
         actual = eval.are_labels_most_likely(logits, labels)
         self.assertTrue(torch.all(expected == actual))
-
-
-        

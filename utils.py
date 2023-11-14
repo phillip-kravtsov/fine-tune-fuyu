@@ -2,6 +2,7 @@ import cProfile
 import gc
 import json
 import os
+import glob
 import random
 from dataclasses import asdict
 
@@ -11,26 +12,21 @@ import torch.distributed as dist
 from PIL import Image
 
 import wandb
-from config import Config
+from config import TrainingConfig
 
 OUTPUT_DIR = "/workspace/fuyu/output"
 
 
-def prepare_inputs(model_inputs, device, fdtype=torch.bfloat16):
-    result = {}
-    for k, v in model_inputs.items():
-        if k in ("is_correct", "question_id"):
-            continue
-        if isinstance(v, torch.Tensor):
-            tensor = v.to(device)
-            if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16):
-                tensor = tensor.to(fdtype)
-            result[k] = tensor
-        elif isinstance(v, list) and isinstance(v[0], torch.Tensor):
-            result[k] = [v_.to(device) for v_ in v]
-        else:
-            result[k] = v
-    return result
+def get_latest_checkpoint_dir(run_name: str) -> str:
+    run_dir = get_run_dir(run_name)
+    paths = glob.glob(os.path.join(run_dir, "step-*"))
+    steps = [p.split("-")[-1] for p in paths]
+    if "final" in steps:
+        checkpoint_dir = os.path.join(run_dir, "step-final")
+    else:
+        step = max([int(s) for s in steps])
+        checkpoint_dir = os.path.join(run_dir, f"step-{step}")
+    return checkpoint_dir
 
 
 def clear_mem():
@@ -154,13 +150,13 @@ def get_run_dir(run_name=None):
     return os.path.join(OUTPUT_DIR, run_name)
 
 
-def load_config(run_name: str) -> Config:
+def load_config(run_name: str) -> TrainingConfig:
     with open(f"{OUTPUT_DIR}/{run_name}/config.json", "r") as f:
         config = json.loads(f.read())
-    return Config(**config)
+    return TrainingConfig(**config)
 
 
-def save_config(config: Config, run_name: str):
+def save_config(config: TrainingConfig, run_name: str):
     run_dir = get_run_dir(run_name)
     if not os.path.exists(run_dir):
         os.makedirs(run_dir)

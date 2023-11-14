@@ -4,7 +4,7 @@ import torch
 from peft import PeftModel, get_peft_model
 from peft.tuners.lora import LoraConfig, LoraLayer
 
-from config import Config
+from config import ModelConfig
 from utils import get_checkpoint_dir
 
 
@@ -14,7 +14,7 @@ def save_lora_model(step, model, tokenizer):
     tokenizer.save_pretrained(get_checkpoint_dir(step))
 
 
-def get_lora_model(model, checkpoint_dir: str, config: Config):
+def get_lora_model(model, checkpoint_dir: str, config: ModelConfig):
     if os.path.exists(os.path.join(checkpoint_dir, "adapter_model")):
         model = PeftModel.from_pretrained(
             model, os.path.join(checkpoint_dir, "adapter_model")
@@ -26,6 +26,7 @@ def get_lora_model(model, checkpoint_dir: str, config: Config):
                 names = name.split(".")
                 lora_module_names.add(names[0] if len(names) == 1 else names[-1])
         lora_module_names.remove("lm_head")
+        lora_module_names.remove("next_patch_predictor")
         if not config.lora_vision:
             lora_module_names.remove("vision_embed_tokens")
         lora_config = LoraConfig(
@@ -48,4 +49,8 @@ def get_lora_model(model, checkpoint_dir: str, config: Config):
             module = module.to(torch.float32)
         if "lm_head" in name or "embed_tokens" in name:
             module = module.to(torch.bfloat16)
+
+    if config.patch_prediction:
+        model.next_patch_predictor.weight.requires_grad = True
+        model.next_patch_predictor.bias.requires_grad = True
     return model

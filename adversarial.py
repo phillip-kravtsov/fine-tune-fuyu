@@ -7,14 +7,14 @@ from PIL import Image
 from tqdm import tqdm
 
 import utils
-from config import Config
+from config import TrainingConfig
 from train import load_model
 
 
 def main():
     input_image_path = "download.jpeg"
     output_image_path = "adv.png"
-    config = Config(use_flash_attn=True)
+    config = TrainingConfig(use_flash_attn=True)
     model, tokenizer = load_model(config, device_map="cuda:0")
 
     image = Image.open(input_image_path)
