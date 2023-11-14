@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from contextlib import nullcontext
 from typing import Tuple
 import numpy as np
@@ -118,7 +118,6 @@ def likelihood_eval_v2(
     if gradient_checkpointing:
         model.language_model.config.use_cache = True
         model.config.use_cache = True
-
         model.language_model.model.gradient_checkpointing_disable()
         model.gradient_checkpointing_disable()
 
@@ -259,35 +258,43 @@ def likelihood_eval(model, dataloader, rank, world_size):
     else:
         return None, None
 
-
-def greedy_eval(model, dataloader: DataLoader, rank: int, world_size: int):
+def eval(model, dataloader: DataLoader, rank: int, world_size: int):
     """
-    Measures the proportion of data points where the labels are the most likely sequence.
+    Measures the proportion of data points where the labels are the most likely sequence, as well 
+    as the loss.
     """
     model.eval()
     correct_tensors = []
-    loss_tensors = []
+    loss_lists = defaultdict(list)
     autocast_context = (
         torch.autocast("cuda") if not isinstance(model, FSDP) else nullcontext()
     )
     with torch.inference_mode():
         for batch in tqdm(dataloader, disable=(rank != 0)):
+            batch = batch.to(rank, torch.bfloat16)
             with autocast_context:
                 try:
-                    outputs = model(**batch.to(rank, torch.bfloat16))
+                    outputs = model(**batch)
                 except torch.cuda.OutOfMemoryError as e:
                     print("Cuda OOM on input with shape", batch["input_ids"].shape)
                     raise e
+
             labels = batch["labels"].to(rank)
-            b = labels.shape[0]
             logits = outputs.logits.float()
             correct_tensors.append(are_labels_most_likely(logits, labels))
-            loss = outputs.loss.item()
-            loss_tensors.append(torch.tensor([loss] * b))
+            nll_loss = outputs.loss
+            loss_lists['nll_loss'].append(nll_loss.view(1))
+            if 'patch_predictions' in outputs:
+                patch_loss = model.get_patch_prediction_loss(batch, outputs)
+                loss_lists['patch_loss'].append(patch_loss.view(1))
 
-    flat_correct = torch.cat(correct_tensors).to(rank)
-    flat_loss = torch.cat(loss_tensors).to(rank)
-    rank_length = torch.tensor(flat_correct.shape[0]).to(rank)
+    loss_tensors = OrderedDict()
+    for k in sorted(loss_lists.keys()):
+        loss_tensors[k] = torch.cat(loss_lists[k]).to(rank) #type: ignore
+
+    flat_correct = torch.cat(correct_tensors).to(rank) # type: ignore
+    rank_length = torch.tensor(flat_correct.shape[0]).to(rank) #type: ignore
+
     lengths = [rank_length for _ in range(world_size)]
     dist.all_gather(lengths, rank_length)
 
@@ -295,19 +302,25 @@ def greedy_eval(model, dataloader: DataLoader, rank: int, world_size: int):
         gather_correct_list = [
             torch.zeros(length.item()).bool().to("cuda:0") for length in lengths
         ]
-        gather_loss_list = [
-            torch.zeros(length.item()).to("cuda:0") for length in lengths
-        ]
         dist.gather(flat_correct, gather_correct_list, dst=0)
-        dist.gather(flat_loss, gather_loss_list, dst=0)
-        all_correct = torch.cat(gather_correct_list)
-        accuracy = all_correct.float().mean()
-        avg_loss = torch.cat(gather_loss_list).mean()
-        return accuracy, avg_loss
+
+        gather_loss_lists = {
+            k: [torch.zeros_like(v) for _ in lengths]
+            for k, v in loss_tensors.items()
+        }
+        for k, v in loss_tensors.items():
+            dist.gather(v, gather_loss_lists[k], dst=0)
+            loss_tensors[k] = torch.cat(gather_loss_lists[k])
+
+        greedy_accuracy = torch.cat(gather_correct_list).float().mean()
+        losses = {k: torch.cat(v).mean() for k, v in gather_loss_lists.items()}
+        return {'greedy_accuracy': greedy_accuracy, **losses}
     else:
         dist.gather(flat_correct, None, dst=0)
-        dist.gather(flat_loss, None, dst=0)
-        return None, None
+        for k, v in loss_tensors.items():
+            v = loss_tensors[k]
+            dist.gather(v, None, dst=0)
+        return {}
 
 
 if __name__ == "__main__":
@@ -332,6 +345,5 @@ if __name__ == "__main__":
     validation_dataloader = scienceqa.get_validation_dataloader(
         eval_config, tokenizer, local_rank, world_size
     )
-    print("Performing greedy eval.")
-    results = greedy_eval(model, validation_dataloader, local_rank, world_size)
+    results = eval(model, validation_dataloader, local_rank, world_size)
     print(results)

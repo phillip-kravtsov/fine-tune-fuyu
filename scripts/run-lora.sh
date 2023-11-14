@@ -17,7 +17,7 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=1 --rdzv-bac
   --train_on_questions \
   --patch_prediction \
   --gradient_checkpointing \
-  --dataset scienceqa \
+  --dataset ai2d \
   --model_name_or_path "fuyu-8b-slim-vocab"
 #  --profile \
 #  --use_packed_sampler \

@@ -124,3 +124,24 @@ class FuyuWithPatchPrediction(FuyuForCausalLM):
         patch_predictions = self.next_patch_predictor(hidden_states)
         outputs["patch_predictions"] = patch_predictions
         return outputs
+
+    def get_patch_prediction_loss(self, batch, outputs):
+        # this is deceptively simple. > 0 makes sure that we skip the first element of the sequence
+        # >= 0 includes all elements. This is like shifting labels in causal language modeling but
+        # accounts for batching correctly
+        patch_predictions = outputs.patch_predictions[
+            batch["image_patches_indices"] > 0
+        ]
+        targets = torch.concat(
+            [
+                image_patches[:, 1:, :]
+                for image_patches in batch["image_patches"]
+            ],
+            dim=1,
+        ).squeeze()
+        criterion = torch.nn.MSELoss()
+        mse_loss = criterion(
+            patch_predictions, targets.to(patch_predictions.dtype)
+        )
+        return mse_loss
+

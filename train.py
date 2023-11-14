@@ -305,27 +305,12 @@ class Trainer:
                 outputs = model(**batch)
             nll_loss = outputs.loss
             if self.config.patch_prediction:
-                # this is deceptively simple. > 0 makes sure that we skip the first element of the sequence
-                # >= 0 includes all elements. This is like shifting labels in causal language modeling but
-                # accounts for batching correctly
-                patch_predictions = outputs.patch_predictions[
-                    batch["image_patches_indices"] > 0
-                ]
-                targets = torch.concat(
-                    [
-                        image_patches[:, 1:, :]
-                        for image_patches in batch["image_patches"]
-                    ],
-                    dim=1,
-                ).squeeze()
-                mse_loss = torch.nn.MSELoss()
-                mse_loss_value = mse_loss(
-                    patch_predictions, targets.to(patch_predictions.dtype)
-                )
-                loss = nll_loss + self.config.alpha * mse_loss_value
+                patch_loss = model.get_patch_prediction_loss(batch, outputs)
+                loss = nll_loss + self.config.alpha * patch_loss
             else:
                 loss = nll_loss
             loss.backward()
+
             if hasattr(model, "clip_grad_norm_"):
                 model.clip_grad_norm_(1.0)
             else:
@@ -340,8 +325,8 @@ class Trainer:
         loss = utils.get_all_reduce_mean(loss).item()
         to_log = {"loss/train": nll_loss}
         if self.config.patch_prediction:
-            to_log["mse_loss/train"] = utils.get_all_reduce_mean(
-                mse_loss_value.detach()
+            to_log["patch_loss/train"] = utils.get_all_reduce_mean(
+                patch_loss.detach()
             ).item()
             to_log["nll_loss/train"] = utils.get_all_reduce_mean(
                 nll_loss.detach()
@@ -379,10 +364,10 @@ class Trainer:
                 self.save_model()
 
             if self.completed_steps % config.eval_every_steps == 0:
-                to_log = self.eval("val")
+                eval_results = self.eval("val")
                 if self.local_rank == 0:
                     wandb.log(
-                        to_log,
+                        eval_results,
                         step=self.completed_steps,
                     )
             if self.completed_steps >= self.max_train_steps:
@@ -395,7 +380,16 @@ class Trainer:
         self.save_model("final")
 
     def eval(self, suffix: str) -> Dict[str, Any]:
-        to_log = {}
+        results = {}
+        if self.val_dataloader is not None:
+            eval_results = eval.eval(
+                self.model,
+                self.val_dataloader,
+                self.local_rank,
+                self.world_size,
+            )
+            for k, v in eval_results.items():
+                results[f"{k}/{suffix}"] = v
         if self.multiple_choice_dataloader is not None:
             strict_accuracy = eval.likelihood_eval_v2(
                 self.model,
@@ -403,28 +397,8 @@ class Trainer:
                 self.local_rank,
                 self.world_size,
             )
-            to_log[f"likelihood_accuracy/{suffix}"] = strict_accuracy
-
-        if self.val_dataloader is not None:
-            """
-            accuracy, loss = eval.likelihood_eval(
-                self.model,
-                self.val_dataloader,
-                self.local_rank,
-                self.world_size,
-            )
-            """
-            strict_accuracy, loss = eval.greedy_eval(
-                self.model,
-                self.val_dataloader,
-                self.local_rank,
-                self.world_size,
-            )
-            to_log[f"strict_accuracy/{suffix}"] = strict_accuracy
-            to_log[f"loss/{suffix}"] = loss
-            # to_log[f"accuracy/{suffix}"] = accuracy
-            # to_log[f"loss-auto/{suffix}"] = loss
-        return to_log
+            results[f"likelihood_accuracy/{suffix}"] = strict_accuracy
+        return results
 
 
 def main():
