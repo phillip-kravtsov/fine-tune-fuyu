@@ -1,11 +1,13 @@
 import os
+import shutil
+import glob
 
 import torch
 from peft import PeftModel, get_peft_model
 from peft.tuners.lora import LoraConfig, LoraLayer
 
 from config import ModelConfig
-from utils import get_checkpoint_dir
+from utils import get_checkpoint_dir, get_run_dir
 
 
 def save_lora_model(step, model, tokenizer):
@@ -15,6 +17,13 @@ def save_lora_model(step, model, tokenizer):
     if hasattr(model.base_model, 'next_patch_predictor'):
         patch_predictor_path = os.path.join(get_checkpoint_dir(step), "patch_predictor.pt")
         torch.save(model.base_model.next_patch_predictor.state_dict(), patch_predictor_path)
+
+    checkpoints = glob.glob(os.path.join(get_run_dir(), "step-*"))
+    if len(checkpoints) > 2:
+        steps = sorted([int(c.split("-")[-1]) for c in checkpoints])
+        for step_to_delete in steps[:-2]:
+            print(f"Deleting checkpoint {step_to_delete}")
+            shutil.rmtree(get_checkpoint_dir(step_to_delete))
 
 
 def get_lora_model(model, checkpoint_dir: str, config: ModelConfig, training: bool):

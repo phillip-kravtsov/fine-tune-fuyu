@@ -16,7 +16,7 @@ def import_experiment(run_name, output_dir, bucket_name):
     if os.path.exists(run_dir):
         print(f'Run dir {run_dir} already exists')
         return
-    bucket_path = f's3://{bucket_name}/fuyu/output/{run_name}/'
+    bucket_path = f's3://{bucket_name}/fuyu/output/{run_name}/*'
     subprocess.run(['s5cmd', 'cp', bucket_path, run_dir])
 
 if __name__ == '__main__':
@@ -29,4 +29,4 @@ if __name__ == '__main__':
     if args.command == 'push':
         export_experiment(args.run_name, args.output_dir, args.bucket)
     elif args.command == 'pull':
-        export_experiment(args.run_name, args.output_dir, args.bucket)
+        import_experiment(args.run_name, args.output_dir, args.bucket)
