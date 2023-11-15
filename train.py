@@ -45,7 +45,7 @@ import wandb
 from config import TrainingConfig, parse_training_args
 from utils import get_checkpoint_dir, get_run_dir
 
-OUTPUT_DIR = "/workspace/fuyu/output"
+OUTPUT_DIR = "/workspace/fine-tune-fuyu/output"
 SAVE_SIGNAL_FILE = "/root/should_save"
 
 
