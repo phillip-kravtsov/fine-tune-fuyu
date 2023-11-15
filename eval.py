@@ -1,22 +1,23 @@
-from collections import defaultdict, OrderedDict
+import os
+from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 from typing import Tuple
-import numpy as np
-import os
 
+import numpy as np
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+import transformers
 from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as FSDP,
 )
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from config import ModelConfig
-import transformers
 from transformers import FuyuForCausalLM, PreTrainedTokenizerFast
 
 import utils
+from config import ModelConfig
+from fuyu import FuyuWithPatchPrediction
 
 
 def load_model(
@@ -258,9 +259,10 @@ def likelihood_eval(model, dataloader, rank, world_size):
     else:
         return None, None
 
+
 def eval(model, dataloader: DataLoader, rank: int, world_size: int):
     """
-    Measures the proportion of data points where the labels are the most likely sequence, as well 
+    Measures the proportion of data points where the labels are the most likely sequence, as well
     as the loss.
     """
     model.eval()
@@ -278,22 +280,24 @@ def eval(model, dataloader: DataLoader, rank: int, world_size: int):
                 except torch.cuda.OutOfMemoryError as e:
                     print("Cuda OOM on input with shape", batch["input_ids"].shape)
                     raise e
-
             labels = batch["labels"].to(rank)
+            if isinstance(outputs, tuple):
+                outputs, patch_predictions = outputs
+                patch_loss = FuyuWithPatchPrediction.get_patch_prediction_loss(
+                    batch, patch_predictions
+                )
+                loss_lists["patch_loss"].append(patch_loss.view(1))
             logits = outputs.logits.float()
             correct_tensors.append(are_labels_most_likely(logits, labels))
             nll_loss = outputs.loss
-            loss_lists['nll_loss'].append(nll_loss.view(1))
-            if 'patch_predictions' in outputs:
-                patch_loss = model.get_patch_prediction_loss(batch, outputs)
-                loss_lists['patch_loss'].append(patch_loss.view(1))
+            loss_lists["nll_loss"].append(nll_loss.view(1))
 
     loss_tensors = OrderedDict()
     for k in sorted(loss_lists.keys()):
-        loss_tensors[k] = torch.cat(loss_lists[k]).to(rank) #type: ignore
+        loss_tensors[k] = torch.cat(loss_lists[k]).to(rank)  # type: ignore
 
-    flat_correct = torch.cat(correct_tensors).to(rank) # type: ignore
-    rank_length = torch.tensor(flat_correct.shape[0]).to(rank) #type: ignore
+    flat_correct = torch.cat(correct_tensors).to(rank)  # type: ignore
+    rank_length = torch.tensor(flat_correct.shape[0]).to(rank)  # type: ignore
 
     lengths = [rank_length for _ in range(world_size)]
     dist.all_gather(lengths, rank_length)
@@ -305,8 +309,7 @@ def eval(model, dataloader: DataLoader, rank: int, world_size: int):
         dist.gather(flat_correct, gather_correct_list, dst=0)
 
         gather_loss_lists = {
-            k: [torch.zeros_like(v) for _ in lengths]
-            for k, v in loss_tensors.items()
+            k: [torch.zeros_like(v) for _ in lengths] for k, v in loss_tensors.items()
         }
         for k, v in loss_tensors.items():
             dist.gather(v, gather_loss_lists[k], dst=0)
@@ -314,7 +317,7 @@ def eval(model, dataloader: DataLoader, rank: int, world_size: int):
 
         greedy_accuracy = torch.cat(gather_correct_list).float().mean()
         losses = {k: torch.cat(v).mean() for k, v in gather_loss_lists.items()}
-        return {'greedy_accuracy': greedy_accuracy, **losses}
+        return {"greedy_accuracy": greedy_accuracy, **losses}
     else:
         dist.gather(flat_correct, None, dst=0)
         for k, v in loss_tensors.items():
@@ -324,8 +327,9 @@ def eval(model, dataloader: DataLoader, rank: int, world_size: int):
 
 
 if __name__ == "__main__":
-    import config
     import argparse
+
+    import config
     import scienceqa
 
     if "LOCAL_RANK" in os.environ:

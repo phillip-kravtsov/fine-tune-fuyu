@@ -24,6 +24,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel as FSDP,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.profiler import profile
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -34,12 +35,13 @@ from transformers.models.persimmon.modeling_persimmon import (
     PersimmonEmbedTokens,
     PersimmonLMHead,
 )
-import fuyu
 
 import ai2d
 import eval
+import fuyu
 import lora
 import scienceqa
+import textvqa
 import utils
 import wandb
 from config import TrainingConfig, parse_training_args
@@ -65,19 +67,21 @@ def save_fsdp_model(step, model, tokenizer, local_rank):
 
         model.save_pretrained(get_checkpoint_dir(step), state_dict=cpu_state)
         tokenizer.save_pretrained(get_checkpoint_dir(step))
-        if os.path.exists(SAVE_SIGNAL_FILE):
-            os.remove(SAVE_SIGNAL_FILE)
 
 
 def save_model(step, model, tokenizer, is_lora, local_rank):
-    return (
+    if local_rank == 0 and is_lora:
         lora.save_lora_model(step, model, tokenizer)
-        if is_lora
-        else save_fsdp_model(step, model, tokenizer, local_rank)
-    )
+    if isinstance(model, FSDP):
+        save_fsdp_model(step, model, tokenizer, local_rank)
+    if isinstance(model, DDP) and local_rank == 0:
+        model_path = os.path.join(get_checkpoint_dir(step), "pytorch_model.bin")
+        torch.save(model.state_dict(), model_path)
+    if local_rank == 0 and os.path.exists(SAVE_SIGNAL_FILE):
+        os.remove(SAVE_SIGNAL_FILE)
 
 
-def load_model(config: TrainingConfig, device_map=None):
+def load_model(config: TrainingConfig, device_map=None, local_rank=None):
     model_path = config.model_name_or_path
     if config.run_name is not None:
         model_path = utils.get_latest_checkpoint_dir(config.run_name)
@@ -87,7 +91,7 @@ def load_model(config: TrainingConfig, device_map=None):
     tokenizer.get_vocab = lambda: vocab
 
     if device_map is None:
-        device_map = f"cuda:{0}" if config.lora else None
+        device_map = f"cuda:{torch.cuda.current_device()}"
     if config.patch_prediction:
         print("Loading patch prediction model")
         model = fuyu.FuyuWithPatchPrediction.from_pretrained(
@@ -97,6 +101,7 @@ def load_model(config: TrainingConfig, device_map=None):
             device_map=device_map,
         )
     else:
+        print("loading non-patch causal lm")
         model = transformers.FuyuForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
@@ -126,15 +131,16 @@ def load_model(config: TrainingConfig, device_map=None):
             transformer_auto_wrap_policy,
             transformer_layer_cls={
                 FuyuVisionEmbedTokens,
-                PersimmonLMHead,
                 PersimmonEmbedTokens,
                 PersimmonDecoderLayer,
+                PersimmonLMHead,
+                fuyu.PatchPrediction,
             },
         )
         model = FSDP(
             model,
             limit_all_gathers=True,
-            cpu_offload=CPUOffload(False),
+            cpu_offload=CPUOffload(True),
             backward_prefetch=None,
             param_init_fn=None,
             auto_wrap_policy=auto_wrap_policy,
@@ -146,6 +152,8 @@ def load_model(config: TrainingConfig, device_map=None):
                 buffer_dtype=torch.bfloat16,
             ),
         )
+    elif config.ddp:
+        model = DDP(model, device_ids=[local_rank])
     return model, tokenizer
 
 
@@ -203,7 +211,6 @@ def get_optimizer(model, max_train_steps: int, config: TrainingConfig):
             for n, p in model.named_parameters()
             if "lora" in n or "next_patch_predictor" in n
         }
-        print(opt_params.keys())
         opt_params = opt_params.values()
     else:
         opt_params = optimizer_grouped_parameters
@@ -303,11 +310,15 @@ class Trainer:
         try:
             with forward_context:
                 outputs = model(**batch)
-            nll_loss = outputs.loss
             if self.config.patch_prediction:
-                patch_loss = model.get_patch_prediction_loss(batch, outputs)
+                outputs, patch_predictions = outputs
+                nll_loss = outputs.loss
+                patch_loss = fuyu.FuyuWithPatchPrediction.get_patch_prediction_loss(
+                    batch, patch_predictions
+                )
                 loss = nll_loss + self.config.alpha * patch_loss
             else:
+                nll_loss = outputs.loss
                 loss = nll_loss
             loss.backward()
 
@@ -363,7 +374,7 @@ class Trainer:
             ):
                 self.save_model()
 
-            if self.completed_steps % config.eval_every_steps == 0:
+            if self.completed_steps % config.eval_every_steps == 0 or self.completed_steps == 1:
                 eval_results = self.eval("val")
                 if self.local_rank == 0:
                     wandb.log(
@@ -422,9 +433,11 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.cuda.set_device(local_rank)
-    print("Initializing process group")
+    print(f"Initializing process group {local_rank}")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-    model, tokenizer = load_model(config)
+    model, tokenizer = load_model(config, device_map=None, local_rank=local_rank)
+    if local_rank == 0:
+        print(model)
     if config.dataset == "ai2d":
         (
             train_dataloader,
@@ -449,6 +462,14 @@ def main():
             local_rank=local_rank,
             world_size=world_size,
         )
+    elif config.dataset == "textvqa":
+        train_dataloader, max_train_steps, val_dataloader = textvqa.get_data(
+            config,
+            tokenizer=tokenizer,
+            local_rank=local_rank,
+            world_size=world_size,
+        )
+        multiple_choice_dataloader = None
     else:
         raise ValueError(f"Unknown dataset {config.dataset}")
 

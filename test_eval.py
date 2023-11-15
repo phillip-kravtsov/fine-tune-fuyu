@@ -1,7 +1,8 @@
 import unittest
-import os
-import eval
+
 import torch
+
+import eval
 
 
 class TestEval(unittest.TestCase):
