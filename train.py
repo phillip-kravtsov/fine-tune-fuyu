@@ -117,7 +117,7 @@ def load_model(config: TrainingConfig, training: bool, device_map=None, local_ra
     if config.run_name is not None:
         model_path = utils.get_latest_checkpoint_dir(config.run_name)
     if config.lora:
-        model = lora.get_lora_model(model, model_path, config)
+        model = lora.get_lora_model(model, model_path, config, training)
     elif config.run_name is not None:
         raise NotImplementedError("Resuming full runs not yet implemented.")
 
@@ -431,7 +431,7 @@ def main():
     torch.cuda.set_device(local_rank)
     print(f"Initializing process group {local_rank}")
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-    model, tokenizer = load_model(config, device_map=None, local_rank=local_rank)
+    model, tokenizer = load_model(config, device_map=None, local_rank=local_rank, training=True)
     if local_rank == 0:
         print(model)
     if config.dataset == "ai2d":
