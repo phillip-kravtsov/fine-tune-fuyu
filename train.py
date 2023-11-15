@@ -81,12 +81,9 @@ def save_model(step, model, tokenizer, is_lora, local_rank):
         os.remove(SAVE_SIGNAL_FILE)
 
 
-def load_model(config: TrainingConfig, device_map=None, local_rank=None):
+def load_model(config: TrainingConfig, training: bool, device_map=None, local_rank=None):
     model_path = config.model_name_or_path
-    if config.run_name is not None:
-        model_path = utils.get_latest_checkpoint_dir(config.run_name)
-
-    tokenizer = transformers.AutoTokenizer.from_pretrained(model_path)
+    tokenizer = transformers.AutoTokenizer.from_pretrained('fuyu-8b-slim-vocab')
     vocab = tokenizer.get_vocab()
     tokenizer.get_vocab = lambda: vocab
 
@@ -117,9 +114,8 @@ def load_model(config: TrainingConfig, device_map=None, local_rank=None):
         model.language_model.model.gradient_checkpointing_enable()
         model.gradient_checkpointing_enable()
 
-    for name, module in model.named_modules():
-        if hasattr(module, "weight"):
-            assert module.weight.dtype == torch.bfloat16, f"{name} is not bfloat16"
+    if config.run_name is not None:
+        model_path = utils.get_latest_checkpoint_dir(config.run_name)
     if config.lora:
         model = lora.get_lora_model(model, model_path, config)
     elif config.run_name is not None:

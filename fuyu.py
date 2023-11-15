@@ -181,15 +181,11 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
 
     @staticmethod
     def get_patch_prediction_loss(batch, patch_predictions):
-        # > 0 makes sure that we skip the first element of the sequence
-        # (note that >= 0 includes all elements)
-        # This is like shifting labels in causal language modeling but
-        # accounts for batching correctly
-        patch_predictions = patch_predictions[batch["image_patches_indices"] > 0]
-        targets = torch.concat(
-            [image_patches[:, 1:, :] for image_patches in batch["image_patches"]],
-            dim=1,
-        ).squeeze()
-        criterion = torch.nn.MSELoss()
-        mse_loss = criterion(patch_predictions, targets.to(patch_predictions.dtype))
-        return mse_loss
+        criterion = torch.nn.HuberLoss()
+        loss = 0
+        for i in range(len(batch['image_patches'])):
+            indices = batch['image_patches_indices'][i]
+            shifted_predictions = patch_predictions[i][indices[indices >= 0][:-1]]
+            shifted_targets = batch['image_patches'][i][0, 1:, :]
+            loss += criterion(shifted_predictions, shifted_targets.to(patch_predictions.dtype))
+        return loss

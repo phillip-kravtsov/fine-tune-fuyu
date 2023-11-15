@@ -14,7 +14,7 @@ from PIL import Image
 import wandb
 from config import TrainingConfig
 
-OUTPUT_DIR = "/workspace/fuyu/output"
+OUTPUT_DIR = "/workspace/fine-tune-fuyu/output"
 
 
 def get_latest_checkpoint_dir(run_name: str) -> str:
@@ -97,6 +97,18 @@ def print_trainable_parameters(model):
     )
 
 
+def unpatchify_image(patches, h, w, patch_h=30, patch_w=30):
+    imarr = np.zeros((patch_h * h, patch_w * w, 3))
+    for i in range(h):
+        for j in range(w):
+            patch_idx = w * i + j
+            imarr[
+                i * patch_h : (i + 1) * patch_h, j * patch_w : (j + 1) * patch_w, :
+            ] = patches[patch_idx].view(patch_h, patch_w, 3)
+    scaled = (((imarr + 1) / 2) * 255).astype(np.uint8)
+    return Image.fromarray(scaled)
+
+        
 # use 1011 and 1019 for slim tokenizer.
 def get_image_from_inputs(
     inputs,
@@ -122,18 +134,11 @@ def get_image_from_inputs(
         if token == image_nl_token:
             h += 1
     assert w * h == patches.shape[0]
-    imarr = np.zeros((patch_h * h, patch_w * w, 3))
-    for i in range(h):
-        for j in range(w):
-            patch_idx = w * i + j
-            imarr[
-                i * patch_h : (i + 1) * patch_h, j * patch_w : (j + 1) * patch_w, :
-            ] = patches[patch_idx].view(patch_h, patch_w, 3)
-    scaled = (((imarr + 1) / 2) * 255).astype(np.uint8)
+    image = unpatchify_image(patches, h, w, patch_h=patch_h, patch_w=patch_w)
     if return_dims:
-        return Image.fromarray(scaled), (w, h)
+        return image, (h, w)
     else:
-        return Image.fromarray(scaled)
+        return image
 
 
 def get_checkpoint_dir(step, run_name=None):
