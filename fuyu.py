@@ -176,7 +176,7 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
         )
 
         hidden_states = outputs.hidden_states[-1]
-        patch_predictions = self.next_patch_predictor(hidden_states)
+        patch_predictions = torch.tanh(self.next_patch_predictor(hidden_states))
         return outputs, patch_predictions
 
     @staticmethod
@@ -190,6 +190,6 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
             [image_patches[:, 1:, :] for image_patches in batch["image_patches"]],
             dim=1,
         ).squeeze()
-        criterion = torch.nn.MSELoss()
+        criterion = torch.nn.HuberLoss()
         mse_loss = criterion(patch_predictions, targets.to(patch_predictions.dtype))
         return mse_loss

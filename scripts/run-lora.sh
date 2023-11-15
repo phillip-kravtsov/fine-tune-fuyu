@@ -3,7 +3,7 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=1 --rdzv-bac
 	train.py \
   --eval_every_steps 250 \
   --save_every_steps 250 \
-  --alpha 3.0 \
+  --alpha 100.0 \
   --lora \
   --lora_alpha 128 \
   --lora_r 128 \
@@ -15,11 +15,11 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=1 --rdzv-bac
   --weight_decay 0.0 \
   --max_eval_ids 250 \
   --use_flash_attn \
-  --train_on_questions \
   --patch_prediction \
   --gradient_checkpointing \
   --dataset textvqa \
   --model_name_or_path "fuyu-8b-slim-vocab" \
-  --run_name "robust-fog-11"
+#  --train_on_questions \
+#  --run_name "robust-fog-11"
 #  --profile \
 #  --use_packed_sampler \

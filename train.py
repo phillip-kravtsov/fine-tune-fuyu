@@ -374,7 +374,7 @@ class Trainer:
             ):
                 self.save_model()
 
-            if self.completed_steps % config.eval_every_steps == 0 or self.completed_steps == 1:
+            if self.completed_steps % config.eval_every_steps == 0:
                 eval_results = self.eval("val")
                 if self.local_rank == 0:
                     wandb.log(
