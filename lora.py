@@ -12,6 +12,9 @@ def save_lora_model(step, model, tokenizer):
     model_path = os.path.join(get_checkpoint_dir(step), "adapter_model")
     model.save_pretrained(model_path)
     tokenizer.save_pretrained(get_checkpoint_dir(step))
+    if hasattr(model.base_model, 'next_patch_predictor'):
+        patch_predictor_path = os.path.join(get_checkpoint_dir(step), "patch_predictor.pt")
+        torch.save(model.base_model.next_patch_predictor.state_dict(), patch_predictor_path)
 
 
 def get_lora_model(model, checkpoint_dir: str, config: ModelConfig):
@@ -19,6 +22,12 @@ def get_lora_model(model, checkpoint_dir: str, config: ModelConfig):
         model = PeftModel.from_pretrained(
             model, os.path.join(checkpoint_dir, "adapter_model")
         )
+        if hasattr(model.base_model, 'next_patch_predictor'):
+            patch_predictor_path = os.path.join(checkpoint_dir, "patch_predictor.pt")
+            if os.path.exists(patch_predictor_path):
+                model.base_model.next_patch_predictor.load_state_dict(
+                    torch.load(patch_predictor_path)
+                )
     else:
         lora_module_names = set()
         for name, module in model.named_modules():

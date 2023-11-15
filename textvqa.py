@@ -2,6 +2,7 @@ import json
 import os
 from collections import Counter
 from typing import Dict
+import random
 
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
@@ -12,10 +13,13 @@ from data import FuyuCollator
 
 
 class TextVQADataset(Dataset):
-    def __init__(self, json_path: str, images_dir: str):
+    def __init__(self, json_path: str, images_dir: str, max_ids=None):
         with open(json_path, "r") as f:
             instances = json.load(f)["data"]
         self.instances = instances
+        if max_ids is not None:
+            random.shuffle(self.instances)
+            self.instances = self.instances[:max_ids]
         self.images_dir = images_dir
 
     def __len__(self):
@@ -84,6 +88,7 @@ def get_validation_dataloader(config, tokenizer, local_rank, world_size):
     validation_dataset = TextVQADataset(
         json_path="/workspace/textvqa/val.json",
         images_dir="/workspace/textvqa/train_val_images",
+        max_ids=config.max_eval_ids,
     )
     validation_sampler = DistributedSampler(
         validation_dataset,

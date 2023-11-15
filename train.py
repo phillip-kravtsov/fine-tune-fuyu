@@ -67,8 +67,6 @@ def save_fsdp_model(step, model, tokenizer, local_rank):
 
         model.save_pretrained(get_checkpoint_dir(step), state_dict=cpu_state)
         tokenizer.save_pretrained(get_checkpoint_dir(step))
-        if os.path.exists(SAVE_SIGNAL_FILE):
-            os.remove(SAVE_SIGNAL_FILE)
 
 
 def save_model(step, model, tokenizer, is_lora, local_rank):
@@ -79,6 +77,8 @@ def save_model(step, model, tokenizer, is_lora, local_rank):
     if isinstance(model, DDP) and local_rank == 0:
         model_path = os.path.join(get_checkpoint_dir(step), "pytorch_model.bin")
         torch.save(model.state_dict(), model_path)
+    if local_rank == 0 and os.path.exists(SAVE_SIGNAL_FILE):
+        os.remove(SAVE_SIGNAL_FILE)
 
 
 def load_model(config: TrainingConfig, device_map=None, local_rank=None):
@@ -211,7 +211,6 @@ def get_optimizer(model, max_train_steps: int, config: TrainingConfig):
             for n, p in model.named_parameters()
             if "lora" in n or "next_patch_predictor" in n
         }
-        print(opt_params.keys())
         opt_params = opt_params.values()
     else:
         opt_params = optimizer_grouped_parameters
@@ -375,7 +374,7 @@ class Trainer:
             ):
                 self.save_model()
 
-            if self.completed_steps % config.eval_every_steps == 0:
+            if self.completed_steps % config.eval_every_steps == 0 or self.completed_steps == 1:
                 eval_results = self.eval("val")
                 if self.local_rank == 0:
                     wandb.log(
