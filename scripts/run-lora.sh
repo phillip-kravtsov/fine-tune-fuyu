@@ -3,14 +3,14 @@ torchrun --role $(hostname -s): --tee 3 --nnodes 1 --nproc-per-node=1 --rdzv-bac
 	train.py \
   --eval_every_steps 250 \
   --save_every_steps 250 \
-  --alpha 100.0 \
+  --alpha 50.0 \
   --lora \
-  --lora_alpha 128 \
-  --lora_r 128 \
+  --lora_alpha 32 \
+  --lora_r 32 \
   --lora_vision \
-  --per_device_batch_size 2 \
+  --per_device_batch_size 3 \
   --eval_batch_size 2 \
-  --learning_rate 5e-5 \
+  --learning_rate 4e-5 \
   --seed 102 \
   --weight_decay 0.0 \
   --max_eval_ids 250 \

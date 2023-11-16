@@ -175,8 +175,8 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
             use_cache=use_cache,
         )
 
-        hidden_states = outputs.hidden_states[-1]
-        patch_predictions = torch.tanh(self.next_patch_predictor(hidden_states))
+        hidden_states = outputs.hidden_states[-3]
+        patch_predictions = self.next_patch_predictor(hidden_states)
         return outputs, patch_predictions
 
     @staticmethod

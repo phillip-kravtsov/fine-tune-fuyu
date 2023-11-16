@@ -8,7 +8,7 @@ BUCKET_NAME = 'philkrav-bucket'
 def export_experiment(run_name, output_dir, bucket_name):
     run_dir = f'{output_dir}/{run_name}'
     assert os.path.exists(run_dir), f'Run dir {run_dir} does not exist'
-    bucket_path = f's3://{bucket_name}/fuyu/output/{run_name}/'
+    bucket_path = f's3://{bucket_name}/fuyu/output/'
     subprocess.run(['s5cmd', 'cp', run_dir, bucket_path])
 
 def import_experiment(run_name, output_dir, bucket_name):

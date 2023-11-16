@@ -202,12 +202,24 @@ def get_optimizer(model, max_train_steps: int, config: TrainingConfig):
         },
     ]
     if config.lora:
-        opt_params = {
-            n: p
-            for n, p in model.named_parameters()
-            if "lora" in n or "next_patch_predictor" in n
-        }
-        opt_params = opt_params.values()
+        opt_params = [
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if "lora" in n
+                ],
+                "learning_rate": config.learning_rate
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if "next_patch_predictor" in n
+                ],
+                "learning_rate": config.learning_rate * 10
+            },
+        ]
     else:
         opt_params = optimizer_grouped_parameters
     utils.print_trainable_parameters(model)
