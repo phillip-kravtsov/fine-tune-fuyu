@@ -185,7 +185,8 @@ class FuyuWithPatchPrediction(FuyuPreTrainedModel):
         loss = 0
         for i in range(len(batch['image_patches'])):
             indices = batch['image_patches_indices'][i]
-            shifted_predictions = patch_predictions[i][indices[indices >= 0][:-1]]
+            shifted_indices = indices[1:]
+            shifted_predictions = patch_predictions[i][:-1][shifted_indices >= 0]
             shifted_targets = batch['image_patches'][i][0, 1:, :]
-            loss += criterion(shifted_predictions, shifted_targets.to(patch_predictions.dtype))
+            loss += criterion(shifted_predictions, shifted_targets.to(shifted_predictions.dtype))
         return loss
