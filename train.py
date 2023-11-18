@@ -1,4 +1,5 @@
 import argparse
+import gc
 import functools
 import glob
 import json
@@ -136,7 +137,7 @@ def load_model(config: TrainingConfig, training: bool, device_map=None, local_ra
         model = FSDP(
             model,
             limit_all_gathers=True,
-            cpu_offload=CPUOffload(True),
+            cpu_offload=CPUOffload(False),
             backward_prefetch=None,
             param_init_fn=None,
             auto_wrap_policy=auto_wrap_policy,
@@ -339,7 +340,10 @@ class Trainer:
             lr_scheduler.step()
         except torch.cuda.OutOfMemoryError as e:
             print("OOM on inputs with shape", batch["input_ids"].shape)
-            raise e
+            gc.collect()
+            with torch.no_grad():
+                torch.cuda.empty_cache()
+            return
         loss = loss.detach()
         loss = utils.get_all_reduce_mean(loss).item()
         to_log = {"loss/train": nll_loss}
@@ -375,6 +379,9 @@ class Trainer:
         if self.local_rank == 0:
             print("Beginning train loop.")
         for batch in tqdm(self.train_dataloader, disable=(self.local_rank != 0)):
+            gc.collect()
+            with torch.no_grad():
+                torch.cuda.empty_cache()
             self.step(batch)
             self.throughput(batch)
             if self.completed_steps % config.save_every_steps == 0 or os.path.exists(
@@ -428,6 +435,7 @@ def main():
         print(f"Loading config from {config.run_name}")
         config = load_config(config.run_name)
     utils.enforce_reproducibility(config.seed)
+    print(config)
     if local_rank == 0:
         pprint.pprint(config)
         print(f"Using seed {config.seed}")
