@@ -38,8 +38,8 @@ from transformers.models.persimmon.modeling_persimmon import (
 )
 
 import eval
-import fuyu
-import lora
+import model.fuyu as fuyu
+import model.lora as lora
 import data.ai2d as ai2d
 import data.scienceqa as scienceqa
 import data.textvqa as textvqa

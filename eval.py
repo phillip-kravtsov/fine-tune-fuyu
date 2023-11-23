@@ -17,7 +17,7 @@ from transformers import FuyuForCausalLM, PreTrainedTokenizerFast
 
 import utils
 from config import ModelConfig
-from fuyu import FuyuWithPatchPrediction
+from model.fuyu import FuyuWithPatchPrediction
 
 
 def load_model(
@@ -330,7 +330,7 @@ if __name__ == "__main__":
     import argparse
 
     import config
-    import scienceqa
+    import data.scienceqa as scienceqa
 
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
