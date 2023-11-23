@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from transformers import FuyuImageProcessor, FuyuProcessor
 
 from config import TrainingConfig
-from data import FuyuCollator
+from .data import FuyuCollator
 
 
 class TextVQADataset(Dataset):

@@ -14,10 +14,10 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers import FuyuImageProcessor, FuyuProcessor
 
-import data as fuyu_data
+from . import data as fuyu_data
 import utils
 from config import TrainingConfig
-from sampler import PackedDistributedBatchSampler
+from data.sampler import PackedDistributedBatchSampler
 
 AI2D_DATA_DIR = "/workspace/ai2d"
 FONT_PATH = "/workspace/Arial.ttf"
@@ -162,37 +162,6 @@ class MultipleAnswerAI2DDataset(Dataset):
             "answers": question.answers,
             "correctAnswer": question.correct_answer,
         }
-
-
-"""
-class AI2DMultipleAnswerDataset(Dataset):
-    def __init__(
-        self,
-        questions: List[MultipleChoiceQuestion],
-        include_labels=True,
-    ):
-        self.include_labels = include_labels
-        self.questions: List[MultipleChoiceQuestion] = questions
-        self.length = sum([len(q.answers) for q in self.questions])
-        self.answer_idx_to_question_idx = [
-            (i, j) for i, q in enumerate(self.questions) for j in range(len(q.answers))
-        ]
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        question_idx, answer_idx = self.answer_idx_to_question_idx[idx]
-        q: MultipleChoiceQuestion = self.questions[question_idx]
-        image = Image.open(q.image_path).convert("RGB")
-        return {
-            "image": image,
-            "text": get_input_text(q),
-            "target": q.answers[answer_idx],
-            "is_correct": answer_idx == q.correct_answer,
-            "question_id": q.question_id,
-        }
-"""
 
 
 def get_data(config: TrainingConfig, world_size: int, local_rank: int, tokenizer):

@@ -37,12 +37,12 @@ from transformers.models.persimmon.modeling_persimmon import (
     PersimmonLMHead,
 )
 
-import ai2d
 import eval
 import fuyu
 import lora
-import scienceqa
-import textvqa
+import data.ai2d as ai2d
+import data.scienceqa as scienceqa
+import data.textvqa as textvqa
 import utils
 import wandb
 from config import TrainingConfig, parse_training_args
@@ -184,24 +184,6 @@ def get_parameter_names(model, forbidden_layer_types):
 def get_optimizer(model, max_train_steps: int, config: TrainingConfig):
     decay_parameters = get_parameter_names(model, [torch.nn.LayerNorm])
     decay_parameters = [name for name in decay_parameters if "bias" not in name]
-    optimizer_grouped_parameters = [
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if (n in decay_parameters and p.requires_grad)
-            ],
-            "weight_decay": config.weight_decay,
-        },
-        {
-            "params": [
-                p
-                for n, p in model.named_parameters()
-                if (n not in decay_parameters and p.requires_grad)
-            ],
-            "weight_decay": 0.0,
-        },
-    ]
     if config.lora:
         opt_params = [
             {
@@ -212,18 +194,37 @@ def get_optimizer(model, max_train_steps: int, config: TrainingConfig):
                 ],
                 "learning_rate": config.learning_rate
             },
-            {
+        ]
+        if config.patch_prediction:
+            opt_params.append({
                 "params": [
                     p
                     for n, p in model.named_parameters()
                     if "next_patch_predictor" in n
                 ],
                 "learning_rate": config.learning_rate * 10
+            })
+    else:
+        opt_params = [
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if (n in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": config.weight_decay,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if (n not in decay_parameters and p.requires_grad)
+                ],
+                "weight_decay": 0.0,
             },
         ]
-    else:
-        opt_params = optimizer_grouped_parameters
     utils.print_trainable_parameters(model)
+
     optimizer = torch.optim.AdamW(
         opt_params,
         foreach=False,
